@@ -13,6 +13,20 @@
 //	了 max_size_mb 时，本包内部用一个简单的"启动期检测 + 改名归档"
 //	实现按大小滚动；MaxBackups / MaxAgeDays 的清理在打开时一次性执行。
 //	这种简化版策略对中间件的"低写入频率"场景已足够，不追求实时滚动。
+//
+// JSON 字段约定（v0.8.4 专业化）：
+//
+//	ts      RFC3339Nano UTC 时间戳（rename 自 slog 默认 "time"，与 Loki /
+//	        Elastic Common Schema 等聚合系统默认字段名对齐）
+//	level   小写："debug" / "info" / "warn" / "error"（slog 默认是大写）
+//	msg     人类可读消息文本
+//	service "xboard-xui-bridge"（识别本中间件，对多服务聚合系统友好）
+//	version 编译期注入的版本号；多版本灰度时按版本切片分析
+//	host    主机名（os.Hostname()）；多节点部署时区分日志来源
+//	pid     进程 PID；便于在 systemd restart 后区分前后实例
+//	module  组件标识（如 web / xui / supervisor / sync）；由各组件
+//	        在自己的 With("module", "...") 中追加
+//	bridge / loop / trace_id  详见 internal/sync engine 注释
 package logger
 
 import (
@@ -29,6 +43,29 @@ import (
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/config"
 )
 
+// serviceName 是注入到所有日志的 service 字段值；与二进制 / systemd unit /
+// 文档中的项目名严格对齐。集中常量便于未来 rename 时一处修改。
+const serviceName = "xboard-xui-bridge"
+
+// JSON 字段键。集中常量便于 grep / 日志聚合工具的字段映射配置。
+const (
+	keyTimestamp = "ts"
+	keyLevel     = "level"
+	keyService   = "service"
+	keyVersion   = "version"
+	keyHost      = "host"
+	keyPID       = "pid"
+)
+
+// BaseAttrs 是所有日志共享的"基线 attrs"。
+//
+// version 由 main.go 在调用 New 时传入（编译期 -ldflags 注入到
+// main.version）；hostname / pid 由 New 自动捕获。多节点 / 多版本部署的
+// 运维通过这三项标签精确切片日志。
+type BaseAttrs struct {
+	Version string
+}
+
 // New 根据配置构造 *slog.Logger，并返回一个 closer 回调用于在 main 退出时
 // 释放可能持有的文件句柄；调用方应当 defer closer()。
 //
@@ -41,7 +78,10 @@ import (
 //
 // 不在运行时持续清理是有意为之：定时清理需要额外 goroutine 和锁，
 // 而中间件单进程长期运行时日志写入量稳定可控，启动期一次性清理已足够。
-func New(cfg config.Log) (*slog.Logger, func() error, error) {
+//
+// base 提供编译期 / 启动期注入的标签（version 等）；nil 时退化为空 BaseAttrs。
+// 调用方约定：main.go 把 version 变量传入；测试场景可传 nil。
+func New(cfg config.Log, base *BaseAttrs) (*slog.Logger, func() error, error) {
 	level, err := parseLevel(cfg.Level)
 	if err != nil {
 		return nil, nil, err
@@ -63,20 +103,61 @@ func New(cfg config.Log) (*slog.Logger, func() error, error) {
 
 	// JSON 是首选格式：易被日志聚合系统识别字段。
 	// 时间字段 RFC3339Nano 精度，便于排查毫秒级时序问题。
+	//
+	// 字段重命名（v0.8.4 起）：
+	//   slog.TimeKey  → ts     与 Loki / ECS 默认字段对齐
+	//   slog.LevelKey → 值改小写  与多数日志聚合系统的语义对齐
+	//   slog.MsgKey   → 保留 msg
+	//
+	// 强制 UTC：开发机（如 Asia/Shanghai）与生产容器（通常 UTC）日志时区
+	// 不一致会让运维跨环境对照 sync 周期 / 上报 LAST_PUSH_AT 时频繁踩
+	// "差 8 小时"坑。一律 UTC 与 store 表中 unix 时间戳的解析基线对齐。
 	handler := slog.NewJSONHandler(w, &slog.HandlerOptions{
 		Level: level,
-		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
-			if a.Key == slog.TimeKey {
-				// slog 默认输出 time.Time，转为 RFC3339Nano 字符串方便人眼阅读。
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			// 仅 top-level（groups 为空）的字段名做重命名——避免嵌套
+			// 用户字段被误改。
+			if len(groups) != 0 {
+				return a
+			}
+			switch a.Key {
+			case slog.TimeKey:
 				if t, ok := a.Value.Any().(time.Time); ok {
-					a.Value = slog.StringValue(t.Format(time.RFC3339Nano))
+					return slog.Attr{
+						Key:   keyTimestamp,
+						Value: slog.StringValue(t.UTC().Format(time.RFC3339Nano)),
+					}
+				}
+			case slog.LevelKey:
+				if lv, ok := a.Value.Any().(slog.Level); ok {
+					return slog.String(keyLevel, strings.ToLower(lv.String()))
 				}
 			}
 			return a
 		},
 	})
 
-	return slog.New(handler), closer, nil
+	logger := slog.New(handler).With(baseAttrs(base)...)
+	return logger, closer, nil
+}
+
+// baseAttrs 把 BaseAttrs + 运行时自动捕获的 host / pid 拼成 slog 的
+// With 参数切片。所有字段都是字符串 / int，便于聚合系统索引。
+func baseAttrs(base *BaseAttrs) []any {
+	version := "dev"
+	if base != nil && strings.TrimSpace(base.Version) != "" {
+		version = base.Version
+	}
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+	return []any{
+		keyService, serviceName,
+		keyVersion, version,
+		keyHost, host,
+		keyPID, os.Getpid(),
+	}
 }
 
 // parseLevel 把字符串等级转为 slog.Level。

@@ -2,6 +2,7 @@ package web
 
 import (
 	"net/http"
+	"sort"
 	"strconv"
 
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/config"
@@ -221,17 +222,34 @@ func (s *Server) handlePatchSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.SetSettings(r.Context(), kv); err != nil {
-		s.log.Error("SetSettings 失败", "err", err)
+		s.log.Error("写入配置失败",
+			"event", "settings_write_error",
+			"err", err,
+		)
 		s.writeError(w, http.StatusInternalServerError, errCodeInternal, "写入配置失败")
 		return
 	}
 	if err := s.reloadFromStore(r.Context()); err != nil {
 		// 把"已经写入但 reload 失败"的状态显式告诉前端：让运维知道需要
 		// 重启进程才能让新值生效。
-		s.log.Error("settings 写入成功但 supervisor.Reload 失败", "err", err)
+		s.log.Error("配置已保存但引擎重载失败",
+			"event", "settings_reload_error",
+			"err", err,
+		)
 		s.writeError(w, http.StatusInternalServerError, errCodeInternal, "配置已保存但引擎重启失败，请检查日志或重启进程")
 		return
 	}
+	// changedKeys 用于审计：让运维清晰看到本次 PATCH 实际改了哪些键。
+	// map 迭代顺序在 Go 中无定序，排序后输出让相同集合的多次日志可比对。
+	changedKeys := make([]string, 0, len(kv))
+	for k := range kv {
+		changedKeys = append(changedKeys, k)
+	}
+	sort.Strings(changedKeys)
+	s.log.Info("配置已更新",
+		"event", "settings_updated",
+		"changed_keys", changedKeys,
+	)
 	s.writeJSON(w, http.StatusOK, struct{}{})
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"runtime/debug"
@@ -86,39 +87,77 @@ func (s *Server) securityHeadersMiddleware(next http.HandlerFunc) http.HandlerFu
 // 设计动机：v0.1 没有 Web 层时进程 panic 等于"流量同步停摆"——靠 systemd
 // 重启即可。v0.2 加 Web 后单次请求的 panic 不应让整个面板与同步引擎一起
 // 重启。recover 后把 panic stack 写到 ERROR 日志，便于后续排查。
+//
+// 双写防护：handler 写了响应后才 panic 时，若再 writeError 会触发 net/http
+// "superfluous response.WriteHeader" warning + 客户端拿到拼接 JSON。本函数
+// 在最外层创建 statusRecorder（loggingMiddleware 复用同一实例），让 recover
+// 在 defer 中能据 sr.wroteHeader 准确判断是否已经写过。已写则仅打日志、
+// 不再写响应；未写才补 500。
+//
+// 链式装配顺序（server.go buildMux）：recover → logging → security → handler；
+// recover 在最外层创建 statusRecorder，loggingMiddleware 拿到的 w 已是
+// statusRecorder（type assertion 复用而非二次包装），避免链路里出现两层
+// recorder 让 wroteHeader 状态被掐断。
 func (s *Server) recoverMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		sr := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		defer func() {
-			if rec := recover(); rec != nil {
-				s.log.Error("HTTP handler panic",
-					"path", r.URL.Path,
-					"method", r.Method,
-					"panic", rec,
-					"stack", string(debug.Stack()),
-				)
-				// 这时候 ResponseWriter 状态未知；尽力写一个 500，失败也只能算了。
-				s.writeError(w, http.StatusInternalServerError, errCodeInternal, "服务器内部错误")
+			rec := recover()
+			if rec == nil {
+				return
 			}
+			s.log.Error("HTTP handler panic",
+				"path", r.URL.Path,
+				"method", r.Method,
+				"panic", rec,
+				"stack", string(debug.Stack()),
+			)
+			// 已写响应头：避免污染。仅在确认未写时补 500。
+			if sr.wroteHeader {
+				return
+			}
+			s.writeError(sr, http.StatusInternalServerError, errCodeInternal, "服务器内部错误")
 		}()
-		next(w, r)
+		next(sr, r)
 	}
 }
 
 // loggingMiddleware 把每次请求的方法 / 路径 / 状态 / 耗时打到 INFO 级日志。
 //
-// 通过 statusRecorder 截获 WriteHeader 调用，记录最终状态码——直接读
-// http.ResponseWriter 拿不到 status。
+// 通过 statusRecorder 截获 WriteHeader 调用，记录最终状态码与响应字节数
+// ——直接读 http.ResponseWriter 拿不到 status。recoverMiddleware 已在最外层
+// 创建 statusRecorder，本函数检测后复用同一实例；防御性兜底：若 w 不是
+// statusRecorder（例如未来某个调用绕过 recoverMiddleware 直接装配本函数），
+// 再创建一个新的 recorder。
+//
+// 日志字段（v0.8.4 专业化）：
+//
+//	event       恒为 "http_access"——便于在聚合系统按 event 切片
+//	method      HTTP 方法
+//	path        URL.Path（不含 query string，避免 token / 敏感参数泄漏到日志）
+//	status      最终响应状态码
+//	bytes_out   响应体字节数（business 侧关心吞吐时友好）
+//	elapsed_ms  耗时毫秒（int 类型，对比 elapsed 字符串更便于 Loki rate 计算）
+//	remote      客户端 IP
+//	user_agent  浏览器标识，便于识别 webhook / robot / 异常 client
 func (s *Server) loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		rec, ok := w.(*statusRecorder)
+		if !ok {
+			rec = &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		}
 		next(rec, r)
-		s.log.Info("HTTP",
+		elapsed := time.Since(start)
+		s.log.Info("HTTP "+r.Method+" "+r.URL.Path,
+			"event", "http_access",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rec.status,
-			"elapsed", time.Since(start),
+			"bytes_out", rec.bytesWritten,
+			"elapsed_ms", elapsed.Milliseconds(),
 			"remote", clientIP(r),
+			"user_agent", r.UserAgent(),
 		)
 	}
 }
@@ -128,31 +167,49 @@ func (s *Server) loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // 必要性：标准 ResponseWriter 接口没有 Status() 方法，只能在 WriteHeader
 // 被调时记录。如果 handler 从未显式调 WriteHeader（典型于 200 OK 路径上
 // 直接 Write），net/http 会在第一次 Write 时 implicit 调 WriteHeader(200)，
-// 我们也照样能截获——statusRecorder.WriteHeader 只在第一次有效，第二次
-// 的覆盖会被 http 包自动忽略并 ERROR 警告。
+// 我们也照样能截获。
+//
+// 双重 WriteHeader 防御（生产关键）：如果 handler 不小心重复调 WriteHeader
+// （典型场景：handler 写了 200 后 recoverMiddleware 又调 writeError 写 500），
+// net/http 会在 stderr 打 "superfluous response.WriteHeader call" warning
+// 污染日志。本 recorder 仅在首次 WriteHeader 时把状态传递给底层，后续重复
+// 调用静默丢弃——业务可观测性（log 记录的 status）保持首次写入的值，与
+// 真实落到客户端的 HTTP 状态完全一致。
+//
+// bytesWritten 字段（v0.8.4 起）：accumulate 累计 Write 字节数，供 access
+// log 输出 bytes_out 字段，让运维做带宽 / 异常响应大小分析。
 type statusRecorder struct {
 	http.ResponseWriter
-	status      int
-	wroteHeader bool
+	status       int
+	wroteHeader  bool
+	bytesWritten int64
 }
 
-// WriteHeader 拦截状态码写入。
+// WriteHeader 拦截状态码写入；仅首次有效，后续重复调用静默丢弃。
 func (sr *statusRecorder) WriteHeader(code int) {
-	if !sr.wroteHeader {
-		sr.status = code
-		sr.wroteHeader = true
+	if sr.wroteHeader {
+		// 已经写过；不再透传到底层，避免 net/http "superfluous
+		// response.WriteHeader call" 噪音。
+		return
 	}
+	sr.status = code
+	sr.wroteHeader = true
 	sr.ResponseWriter.WriteHeader(code)
 }
 
 // Write 截获隐式 WriteHeader：handler 直接 Write 不调 WriteHeader 时，
 // 标准库会按 200 触发，这里同步记录。
+//
+// 同时累计 bytesWritten 供 access log；底层 Write 返回真实写入字节数
+// （可能小于 len(p)），故按返回值累加而非 len(p) 来保证统计准确。
 func (sr *statusRecorder) Write(p []byte) (int, error) {
 	if !sr.wroteHeader {
 		sr.status = http.StatusOK
 		sr.wroteHeader = true
 	}
-	return sr.ResponseWriter.Write(p)
+	n, err := sr.ResponseWriter.Write(p)
+	sr.bytesWritten += int64(n)
+	return n, err
 }
 
 // authMiddleware 校验 session cookie 并把当前用户写入 ctx。
@@ -282,23 +339,26 @@ func clientIP(r *http.Request) string {
 
 // splitHostPort 是 net.SplitHostPort 的薄包装。
 //
-// 包装动机：可能 RemoteAddr 是空字符串或纯 host（极罕见），net.SplitHostPort
-// 会报错。本函数把错误返回出去，让 clientIP 回退到原值。
+// 包装动机：RemoteAddr 极少情形下可能是空字符串或纯 host（无 port），
+// net.SplitHostPort 会报错；本函数返回这些错误让 clientIP 回退到原值。
+//
+// 必须使用标准库 net.SplitHostPort 而不是手写字符串切割：IPv6 形式
+// `[::1]:8787` / `[::1]` / `2001:db8::1:8787`（无方括号但 host 含冒号）
+// 等多种合法形态混杂，手写 strings.LastIndex(":") 会把 host-only 的 `[::1]`
+// 错切成 host=`[::`、port=`1]`——已被 Codex 审查指出并在生产 Linux 容器
+// （RemoteAddr 偶发 IPv6 link-local 形态）观察到过空字段日志。
 func splitHostPort(addr string) (host, port string, err error) {
 	if addr == "" {
 		return "", "", errors.New("addr 为空")
 	}
-	// 复用标准库实现：net.SplitHostPort 处理 ipv6 [::1]:8787 等格式比手写
-	// 字符串 split 稳。
-	idx := strings.LastIndex(addr, ":")
-	if idx < 0 {
-		return addr, "", nil
+	host, port, err = net.SplitHostPort(addr)
+	if err == nil {
+		return host, port, nil
 	}
-	host = addr[:idx]
-	port = addr[idx+1:]
-	// 处理 ipv6 形式 [::1]
-	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
-	return host, port, nil
+	// 兜底：addr 既非 host:port 也非 [host]:port 形态，可能是纯 host
+	// （RemoteAddr 极端边角下可能没有 port，如某些自定义 listener）。
+	// 仍然返回原 host 让 clientIP 可用，但 err 透出去让调用方按需决策。
+	return addr, "", err
 }
 
 // readSessionCookie 从请求里取 bridge_session cookie 的值。

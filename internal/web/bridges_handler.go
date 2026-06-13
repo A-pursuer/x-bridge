@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -8,6 +9,14 @@ import (
 
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/store"
 )
+
+// deleteCleanupTimeout 是 handleDeleteBridge 在客户端断连后仍然完成
+// reload + cleanup 所允许的最大时长。
+//
+// 选 30 秒：reload 内部用 reloadTimeout=15s 等旧引擎退出，加上 baseline
+// 清理 + supervisor 切换状态的开销 < 5s；30s 留 2× 头空间足够。不设更长
+// 是为了避免一个挂掉的 reload 让 handler goroutine 持续占用资源。
+const deleteCleanupTimeout = 30 * time.Second
 
 // bridgeResponse 是 GET /api/bridges 与单条返回共用的对外结构。
 type bridgeResponse struct {
@@ -83,16 +92,32 @@ func (s *Server) handleCreateBridge(w http.ResponseWriter, r *http.Request) {
 		default:
 			// store 层已做 name/protocol 非空 trim 校验；其余错误（DB 故障 / SQLite BUSY）
 			// 一律 500。
-			s.log.Error("CreateBridge 失败", "name", row.Name, "err", err)
+			s.log.Error("创建桥接失败",
+				"event", "bridge_create_error",
+				"name", row.Name,
+				"err", err,
+			)
 			s.writeError(w, http.StatusInternalServerError, errCodeInternal, "创建桥接失败")
 		}
 		return
 	}
 	if err := s.reloadFromStore(r.Context()); err != nil {
-		s.log.Error("CreateBridge 后 reload 失败", "name", row.Name, "err", err)
+		s.log.Error("创建桥接后引擎重载失败",
+			"event", "bridge_create_reload_error",
+			"name", row.Name,
+			"err", err,
+		)
 		s.writeError(w, http.StatusInternalServerError, errCodeInternal, "桥接已保存但引擎重载失败，请检查日志")
 		return
 	}
+	s.log.Info("桥接创建完成",
+		"event", "bridge_created",
+		"name", row.Name,
+		"protocol", row.Protocol,
+		"xboard_node_id", row.XboardNodeID,
+		"xui_inbound_id", row.XuiInboundID,
+		"enabled", row.Enable,
+	)
 	// 取一次最新行回传（带 created_at / updated_at）。
 	saved, err := s.store.GetBridge(r.Context(), row.Name)
 	if err != nil {
@@ -127,16 +152,30 @@ func (s *Server) handleUpdateBridge(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, store.ErrNotFound):
 			s.writeError(w, http.StatusNotFound, errCodeNotFound, "桥接不存在："+row.Name)
 		default:
-			s.log.Error("UpdateBridge 失败", "name", row.Name, "err", err)
+			s.log.Error("更新桥接失败",
+				"event", "bridge_update_error",
+				"name", row.Name,
+				"err", err,
+			)
 			s.writeError(w, http.StatusInternalServerError, errCodeInternal, "更新桥接失败")
 		}
 		return
 	}
 	if err := s.reloadFromStore(r.Context()); err != nil {
-		s.log.Error("UpdateBridge 后 reload 失败", "name", row.Name, "err", err)
+		s.log.Error("更新桥接后引擎重载失败",
+			"event", "bridge_update_reload_error",
+			"name", row.Name,
+			"err", err,
+		)
 		s.writeError(w, http.StatusInternalServerError, errCodeInternal, "桥接已保存但引擎重载失败，请检查日志")
 		return
 	}
+	s.log.Info("桥接更新完成",
+		"event", "bridge_updated",
+		"name", row.Name,
+		"protocol", row.Protocol,
+		"enabled", row.Enable,
+	)
 	saved, err := s.store.GetBridge(r.Context(), row.Name)
 	if err != nil {
 		s.writeJSON(w, http.StatusOK, marshalBridge(&row))
@@ -160,21 +199,103 @@ func (s *Server) handleUpdateBridge(w http.ResponseWriter, r *http.Request) {
 // user_sync 仅在用户被禁/删时单条删 baseline。删除桥接后这部分数据成为
 // 无主行，占用极少（< 1KB / user）。v0.3 计划新增
 // store.DeleteBaselinesByBridge 一次性清理。
+// handleDeleteBridge 实现"删 bridge → 停旧 worker → 清 baseline"的正确顺序。
+//
+// 顺序约束（Codex 审查指出的并发竞态）：
+//
+//	a) 先删 bridges 行（store 写入立即可见）；
+//	b) 调 reloadFromStore：supervisor.Reload 让旧 sync worker 停掉
+//	   （新 cfg 已不含该 bridge → 新 engine 不会再装配 worker）；
+//	c) 此时**没有任何 goroutine**会再访问该 bridge_name 的 baseline——
+//	   调 DeleteBaselinesByBridge 清理可放心进行。
+//
+// 旧实现（v0.8.4 之前）把 a 与 c 合并到一个事务里，结果：旧 sync worker
+// 在 reload 完成前仍会调 EnsureBaseline / RecordSeen / ApplyReportSuccess
+// 把刚清掉的 baseline 重新写回——清理失效。新流程让 c 必然发生在旧 worker
+// 退出之后，杜绝并发写覆盖。
+//
+// 容错策略：a 成功后 b 失败时，bridges 表已无该行 + 旧 engine 仍在跑该
+// bridge → 旧 worker 下次访问 baseline 时不会发现 user_sync 的 wanted 状态
+// （Xboard 仍返回用户）但 3x-ui 端 inbound 还在——它会继续维护 baseline，
+// 直到下次重启 / 下次 reload 成功。Web 返回 5xx 让运维介入；c 不执行
+// （baseline 残留但不影响功能）。
+//
+// c 失败但 a + b 成功时：bridge 已被彻底移除、baseline 残留。残留量按典型
+// 几千用户 × 数十字节 ≈ < 1 MB，对 SQLite 无感；下次重启进程不会自动清理
+// （没有"定时清理孤儿 baseline"机制），运维可手工 sqlite3 删除或下次该
+// bridge 名被重用时手动清。仅打 WARN 日志，response 仍返回 200——避免
+// 让运维以为"删除失败要重试"。
+//
+// 客户端断连防护（v0.8.4 二轮 Codex 审查指出）：步骤 a 写入持久层后，若
+// 仍使用 r.Context() 做 b/c，客户端在 a 之后断连会让 r.Context() 立即取消，
+// b/c 被中断——bridges 行已删但 engine 仍跑旧 worker + baseline 残留。
+// 改为 a 仍用 r.Context()（用户主动断连是合理的"取消请求"信号，store 写
+// 失败不会留下副作用），b/c 用独立 bounded ctx（deleteCleanupTimeout）：
+// 一旦写库成功，后续清理就必须跑完，不再受请求生命周期约束。30s 上限避
+// 免 handler goroutine 因 reload 卡死被永久占用。
 func (s *Server) handleDeleteBridge(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(r.PathValue("name"))
 	if name == "" {
 		s.writeError(w, http.StatusBadRequest, errCodeBadRequest, "URL 缺少 name")
 		return
 	}
+	// 步骤 1：删 bridges 行（不动 baseline）。仍走 r.Context()——客户端
+	// 此时主动断连是合理的"取消请求"信号，store.DeleteBridge 是单条
+	// DELETE 语句，要么成功要么失败，无中间状态副作用。
 	if err := s.store.DeleteBridge(r.Context(), name); err != nil {
-		s.log.Error("DeleteBridge 失败", "name", name, "err", err)
+		s.log.Error("删除桥接失败",
+			"event", "bridge_delete_error",
+			"name", name,
+			"err", err,
+		)
 		s.writeError(w, http.StatusInternalServerError, errCodeInternal, "删除桥接失败")
 		return
 	}
-	if err := s.reloadFromStore(r.Context()); err != nil {
-		s.log.Error("DeleteBridge 后 reload 失败", "name", name, "err", err)
+
+	// 步骤 2/3 切到独立 bounded ctx：客户端断连不再能中断后续清理；详见
+	// 函数注释"客户端断连防护"段落。仍记录用户端原 ctx 是否已取消供日志
+	// 观察——但不参与控制流。
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), deleteCleanupTimeout)
+	defer cancel()
+	if rerr := r.Context().Err(); rerr != nil {
+		s.log.Info("桥接删除：客户端在写库后断连，cleanup 阶段切换独立 ctx 继续",
+			"name", name,
+			"req_ctx_err", rerr,
+		)
+	}
+
+	// 步骤 2：reload 让旧 sync worker 退出。
+	if err := s.reloadFromStore(cleanupCtx); err != nil {
+		s.log.Error("删除桥接后引擎重载失败",
+			"event", "bridge_delete_reload_error",
+			"name", name,
+			"err", err,
+		)
+		// 客户端可能已断开；写 5xx 是 best-effort——若写失败 net/http 内部
+		// 会忽略，不影响 cleanup 路径。
 		s.writeError(w, http.StatusInternalServerError, errCodeInternal, "桥接已删除但引擎重载失败，请检查日志")
 		return
+	}
+	// 步骤 3：清 baseline。此时已无 worker 访问，安全。
+	deletedBaselines, err := s.store.DeleteBaselinesByBridge(cleanupCtx, name)
+	if err != nil {
+		// baseline 清理失败不影响 bridge 删除成功；记 WARN 让运维知情。
+		s.log.Warn("桥接删除：traffic_baseline 清理失败（不影响业务，下次重启后可手工清理）",
+			"event", "bridge_delete_baseline_cleanup_failed",
+			"name", name,
+			"err", err,
+		)
+	} else if deletedBaselines > 0 {
+		s.log.Info("桥接删除：连带清理 traffic_baseline",
+			"event", "bridge_deleted",
+			"name", name,
+			"deleted_baselines", deletedBaselines,
+		)
+	} else {
+		s.log.Info("桥接删除完成",
+			"event", "bridge_deleted",
+			"name", name,
+		)
 	}
 	s.writeJSON(w, http.StatusOK, struct{}{})
 }

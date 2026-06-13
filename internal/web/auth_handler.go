@@ -44,7 +44,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !s.loginLimiter.reserveAttempt(ip) {
 		// 仅在限流命中时打 WARN——让运维能在日志里发现暴力破解尝试，
 		// 但不打 ERROR 避免被运维监控系统误判为故障。
-		s.log.Warn("登录限流命中：IP 在窗口期内失败次数超出上限",
+		s.log.Warn("登录限流命中",
+			"event", "login_rate_limited",
 			"ip", ip,
 			"max_attempts", loginRateLimitMaxAttempts,
 			"window", loginRateLimitWindow.String(),
@@ -78,12 +79,22 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	case err != nil && token != "":
 		// 非致命错误：例如 last_login_at 更新失败但 session 已落库（auth.Login 契约）。
 		// 仅 WARN 提示运维，登录路径继续走完——把 token 还给用户避免一次"虚假失败"。
-		s.log.Warn("Login 部分成功（非致命）", "username", username, "err", err)
+		s.log.Warn("登录部分成功（非致命）",
+			"event", "login_partial",
+			"username", username,
+			"ip", ip,
+			"err", err,
+		)
 	case err != nil:
 		// 致命：未拿到 token，登录确实失败。撤销预占——5xx 与暴力破解无关，
 		// 真用户不该因服务端故障被白消耗名额。
 		s.loginLimiter.rollbackAttempt(ip)
-		s.log.Error("Login 失败", "username", username, "err", err)
+		s.log.Error("登录处理失败",
+			"event", "login_error",
+			"username", username,
+			"ip", ip,
+			"err", err,
+		)
 		s.writeError(w, http.StatusInternalServerError, errCodeInternal, "服务器内部错误")
 		return
 	}
@@ -91,6 +102,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// 走到这里 = 登录成功（含"部分成功"路径）：删除该 IP entry，让该 IP
 	// 后续的输错回到干净计数。
 	s.loginLimiter.recordSuccess(ip)
+	s.log.Info("登录成功",
+		"event", "login_success",
+		"username", username,
+		"ip", ip,
+	)
 
 	// 计算 cookie maxAge：用 supervisor.Snapshot 当前生效的 cfg.Web.SessionMaxAgeHours。
 	// 不直接持有 cfg：Web 的运行时参数（如 sessionMaxAge）是由 supervisor 持有

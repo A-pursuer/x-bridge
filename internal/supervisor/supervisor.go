@@ -47,9 +47,18 @@ import (
 // Supervisor 是引擎的生命周期管理者。
 //
 // 字段不直接暴露：所有对 cfg / current 的访问都通过 mu 串行化。
+//
+// 字段说明：
+//
+//	log     带 module=supervisor 的派生 logger，仅本组件内部日志使用；
+//	rootLog 不带 module 的原始 logger，buildEngine 把它传给子组件
+//	        （xui / syncengine），让子组件在自己的 New 中各自追加自己的
+//	        module 字段，避免 JSON 输出出现两个 module 键
+//	        （v0.8.4 Codex 审查指出的重复字段问题）。
 type Supervisor struct {
 	mu      stdsync.Mutex
 	log     *slog.Logger
+	rootLog *slog.Logger
 	store   store.Store
 
 	// cfg 当前生效的配置；Reload 成功时被替换。Run 启动期间也是这个值。
@@ -101,9 +110,10 @@ func New(cfg *config.Root, log *slog.Logger, st store.Store) (*Supervisor, error
 		return nil, errors.New("supervisor: store 不可为 nil")
 	}
 	return &Supervisor{
-		log:   log.With("component", "supervisor"),
-		store: st,
-		cfg:   cfg,
+		log:     log.With("module", "supervisor"),
+		rootLog: log,
+		store:   st,
+		cfg:     cfg,
 	}, nil
 }
 
@@ -136,13 +146,16 @@ func (s *Supervisor) Run(rootCtx context.Context) error {
 	bridgeCount := len(s.cfg.Bridges)
 	s.mu.Unlock()
 
-	s.log.Info("引擎已启动，等待退出信号",
+	s.log.Info("引擎已启动",
+		"event", "engine_started",
 		"bridges", bridgeCount,
 		"creds_guard_triggered", guarded,
 	)
 
 	<-rootCtx.Done()
-	s.log.Info("收到退出信号，开始优雅停止")
+	s.log.Info("收到退出信号，开始优雅停止",
+		"event", "engine_shutdown_begin",
+	)
 
 	s.mu.Lock()
 	s.running = false
@@ -221,6 +234,7 @@ func (s *Supervisor) Reload(ctx context.Context, newCfg *config.Root) error {
 	s.cfg = newCfg
 
 	s.log.Info("引擎热重载完成",
+		"event", "engine_reloaded",
 		"bridges", len(newCfg.Bridges),
 		"creds_guard_triggered", guarded,
 	)
@@ -278,14 +292,15 @@ func (s *Supervisor) startLocked(cfg *config.Root) error {
 // 可以"先构造，发现错误就立刻返回；构造成功再杀旧启新"。
 func (s *Supervisor) buildEngine(cfg *config.Root) (*syncengine.Engine, error) {
 	xboardC := xboard.New(cfg.Xboard)
-	// 把 Supervisor 的 logger 直传进 xui.Client：client 内部仅在 scheme
-	// 自动翻转时打一行 WARN（详见 internal/xui/client.go do/Schemeswap
-	// 注释），共享同一个 JSON handler 便于运维侧统一聚合。
-	xuiC, err := xui.New(cfg.Xui, s.log)
+	// 传 rootLog 而非 s.log：子组件（xui / syncengine）在自己的 New 中
+	// 各自追加 module=xui / module=sync；若传入已带 module=supervisor 的
+	// s.log，会让 JSON 输出出现两个 module 键。详见 Supervisor 字段注释
+	// 中"rootLog"段落（v0.8.4 Codex 审查闭环）。
+	xuiC, err := xui.New(cfg.Xui, s.rootLog)
 	if err != nil {
 		return nil, fmt.Errorf("初始化 3x-ui 客户端：%w", err)
 	}
-	eng, err := syncengine.New(cfg, s.log, xboardC, xuiC, s.store)
+	eng, err := syncengine.New(cfg, s.rootLog, xboardC, xuiC, s.store)
 	if err != nil {
 		return nil, fmt.Errorf("装配同步引擎：%w", err)
 	}
@@ -350,10 +365,12 @@ func applyCredsGuard(cfg *config.Root, log *slog.Logger) bool {
 		// 没有 enabled bridge：worker 数本来就是 0，无须清空。
 		return false
 	}
-	log.Warn("检测到启用的 Bridge 但凭据未完整配置，引擎将以空载模式启动以避免无效上游请求",
+	log.Warn("启用的 Bridge 存在但凭据未完整配置，引擎将以空载模式启动",
+		"event", "creds_guard_triggered",
 		"enabled_bridge_count", enabledCount,
 		"xboard_creds_ok", xboardOK,
 		"xui_creds_ok", xuiOK,
+		"hint", "在 Web 面板补齐凭据并保存配置以恢复正常工作",
 	)
 	cfg.Bridges = nil
 	return true

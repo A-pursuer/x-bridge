@@ -178,12 +178,11 @@ func New(cfg config.Xui, logger *slog.Logger) (*Client, error) {
 	c := &Client{
 		apiToken:   cfg.APIToken,
 		httpClient: httpClient,
-		// 直接复用上游 logger，不再 With("component", "xui")：项目里 component
-		// 字段在顶层只被 supervisor/web 各设置一次（sync engine 也仅追加
-		// bridge/loop/trace_id 而不重写 component），与该惯例对齐避免 JSON
-		// 输出出现重复 component 键。WARN 消息文本里已显式带 "xui" 字样
-		// 可让运维快速定位。
-		logger: logger,
+		// 注入 module=xui 让所有 xui Client 日志带统一标签——v0.8.4 起项目
+		// 各组件（supervisor / web / sync）都用 module 字段标识自己；之前
+		// 由于 xui Client 只在 scheme 翻转时打一行 WARN，复用上游 logger
+		// 没有 module 字段会让运维过滤"xui 模块的日志"困难。
+		logger: logger.With("module", "xui"),
 	}
 	// 初始 baseURL 入字段前先把 scheme 规一化为小写：用户在配置层填入
 	// "HTTPS://" 也合法（config.validateHTTPHost 借 url.Parse 做大小写不
@@ -382,11 +381,37 @@ func (c *Client) fetchInbounds(ctx context.Context) ([]Inbound, error) {
 // fetch 失败、所有 waiter 一起失败——这与"同一引擎所有 worker 共用 ctx
 // 树"的现实一致；引擎退出时所有 worker 也都将退出，无需独立 detach ctx。
 //
+// Panic 防护（v0.8.4 修复 Codex 审查指出的死锁风险）：fetcher 在 fetchInbounds
+// 内部走标准库 net/http + json 路径，理论上不应 panic；但任意 nil pointer
+// 解码 / 闭包变量异常等极端边角都可能 panic——若 panic 路径未清理
+// c.listInflight + 未 close(done)，所有正在等待 done channel 的 caller 会
+// **永久阻塞**直到进程被强杀；同时下一波 caller 看到 inflight 仍非 nil 也
+// 会跟着卡。
+//
+// 处理策略：
+//   a) defer 中清理 inflight 槽位（无条件，含 panic 路径）；
+//   b) panic 时用 fmt.Errorf("xui.fetchInbounds panic: %v", rec) 包装成
+//      普通 error 写入 inflight.result 并 close(done)——所有 waiter 看到
+//      错误返回。该 error 不是 *xui.Error 类型（不携带 HTTPStatus / Endpoint
+//      等结构化字段），因为 panic 信息只有 stack-time 的 recover 值，没有
+//      请求层的元信息可填；上层 syncTraffic / syncAlive 只关心 err != nil
+//      即报"本周期失败"，无需类型断言；
+//   c) **不 re-panic**：本函数返回给调用方一个普通 error（含 panic 信息）。
+//      v0.8.4 之前曾用 panic(rec) 上抛，但 runStep 此前无 recover，会让整个
+//      Go 进程 crash；现 runStep 已加 recover，但此处仍走 error 返回更稳——
+//      让 sync 层按"本周期同步失败 + warn 日志"正常处理，与其它 HTTP /
+//      网络错误对齐，运维不需要区分"panic vs 网络抖动"两种异常路径。
+//
 // 并发不变量：c.listInflight 仅在持有 listMu 时被读 / 写；从 nil → 非 nil
 // 与 非 nil → nil 都在 listMu 临界区内完成。fetcher 释放 listMu 期间其它
 // goroutine 看到非 nil inflight 并订阅 done channel；fetcher 拿回 listMu
 // 把 inflight 清空之后再 close(done)——任何已订阅的 waiter 都能正常醒来。
-func (c *Client) fetchInboundsCached(ctx context.Context) ([]Inbound, error) {
+//
+// Named return values（v0.8.4 起）：defer 中需要在 panic 路径修改返回的
+// err / inbounds 让 caller 拿到 panic-as-error。Go 函数体 panic 中断后，
+// defer 内对 unnamed return value 的修改不会被外层观察到——caller 会拿到
+// 零值 (nil, nil) 误以为 fetch 成功且无 inbounds。必须用 named return。
+func (c *Client) fetchInboundsCached(ctx context.Context) (inbounds []Inbound, err error) {
 	c.listMu.Lock()
 	if !c.listExpireAt.IsZero() && time.Now().Before(c.listExpireAt) {
 		cached := c.listCache
@@ -408,20 +433,41 @@ func (c *Client) fetchInboundsCached(ctx context.Context) ([]Inbound, error) {
 	c.listInflight = inflight
 	c.listMu.Unlock()
 
-	inbounds, err := c.fetchInbounds(ctx)
+	// finished 区分"fetchInbounds 已返回（无论成功失败）" vs "尚未开始 /
+	// 中途 panic"。defer 用它决定是否更新 cache。
+	finished := false
+	defer func() {
+		// 顺序：先 recover 把 panic 转成 err（影响 cache 判断），再持锁
+		// 清理 inflight 槽位 + 按需更新 cache，最后写 result + close(done)。
+		//
+		// 旧实现把 recover 放在最后一步，但那样 cache 路径基于"未 recover
+		// 前的初始 err=nil"判定，panic 路径下 inbounds 可能是部分赋值的
+		// 垃圾数据，cache 判定要靠 finished 二次防御才不出错。把 recover
+		// 提前让 err 在 cache 判定时已是最终态，逻辑更直观。
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("xui.fetchInbounds panic: %v", rec)
+			inbounds = nil
+			finished = false
+		}
 
-	c.listMu.Lock()
-	if err == nil {
-		c.listCache = inbounds
-		c.listExpireAt = time.Now().Add(listCacheTTL)
-	}
-	c.listInflight = nil
-	c.listMu.Unlock()
+		c.listMu.Lock()
+		if err == nil && finished {
+			// 仅在 fetch 真正成功完成时才更新 cache。panic / 失败路径
+			// 都保留旧 cache 在剩余 TTL 内继续生效。
+			c.listCache = inbounds
+			c.listExpireAt = time.Now().Add(listCacheTTL)
+		}
+		c.listInflight = nil
+		c.listMu.Unlock()
 
-	// 写 result 必须在 close(done) 之前完成；close 之后 reader 可立即读 result。
-	inflight.result = listFetchResult{inbounds: inbounds, err: err}
-	close(inflight.done)
+		// 写最终 result + 关 done channel。写必须在 close 之前完成，
+		// 否则 reader 看到 done 已 close 但 result 还是零值。
+		inflight.result = listFetchResult{inbounds: inbounds, err: err}
+		close(inflight.done)
+	}()
 
+	inbounds, err = c.fetchInbounds(ctx)
+	finished = true
 	return inbounds, err
 }
 
@@ -714,12 +760,15 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body any) (jso
 	newPtr := &newBase
 	retryBase := newBase
 	if c.baseURL.CompareAndSwap(baseSnap, newPtr) {
-		c.logger.Warn("检测到 3x-ui 面板侧协议与 xui.api_host 配置不一致，自动翻转 scheme 后重试（运维侧建议同步把 xui.api_host 改为新的协议头，避免下次重启再次踩到首次失败）",
-			"module", "xui",
+		// module=xui 已经在 New 中通过 c.logger = logger.With(...) 注入，
+		// 此处不再重复，避免 JSON 输出出现两个同名键。
+		c.logger.Warn("3x-ui 面板侧协议与 xui.api_host 配置不一致，自动翻转 scheme 后重试",
+			"event", "xui_scheme_autoswitch",
 			"old_base", *baseSnap,
 			"new_base", newBase,
 			"endpoint", endpoint,
 			"trigger_err", err.Error(),
+			"hint", "运维侧建议把 xui.api_host 同步改为新的协议头，避免下次重启再次踩到首次失败",
 		)
 	} else {
 		// CAS 失败说明另一个 goroutine 已经写过 baseURL：通常它写的是与

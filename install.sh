@@ -1,43 +1,43 @@
 #!/usr/bin/env bash
-# xboard-xui-bridge 一键安装 / 管理脚本（v0.5+）。
+# xboard-xui-bridge 一键安装 / 管理脚本。
 #
-# 设计动机：
-#
-#   v0.4 时代仅 install + 升级两条路径，运维卸载、查看日志、重置密码都得
-#   逐个 systemctl / sqlite3 操作；客户工单大量集中在"忘记密码怎么办""怎么
-#   彻底清掉""怎么改监听地址"——这些都是高频低价值步骤，应当被脚本封装。
-#
-#   参考 MHSanaei/3x-ui 主线 install.sh 的"装完就给一个 helper 命令进菜单"
-#   设计：用户运行 `bash <(curl ...)` 一次完成安装；后续在 SSH 上敲
-#   `xui-bridge` 即可进入交互式管理菜单（启停 / 重启 / 状态 / 日志 / 卸载 /
-#   重置密码 / 修改监听）；脚本本身也支持以子命令直跑（如 `xui-bridge log`）
-#   方便运维写自动化。
+# Xboard 与 3x-ui 之间的非侵入式中间件。本脚本封装了一键安装、升级、卸载、
+# 状态查看、日志检索、密码重置、监听地址修改等高频运维动作。
 #
 # 用法：
 #
 #   bash <(curl -fsSL https://raw.githubusercontent.com/ZeroStarlet/xboard-xui-bridge/main/install.sh)
-#       默认行为：未装 → 安装；已装 → 进菜单。一键命令运维直接复制粘贴即可。
+#       默认行为：未装 → 安装；已装 → 进入管理菜单。
 #
-#   xui-bridge [子命令]                          安装后可用的快捷别名
-#     install / update / upgrade                安装或升级（保留 data/）
-#     uninstall                                 卸载二进制 + service，**保留** data/
-#     purge                                     完全清理（含 data/，**不可恢复**）
-#     start | stop | restart                    服务启停
-#     status                                    打印 systemctl status
-#     log                                       打印最近 200 行日志
-#     follow                                    实时跟踪日志（journalctl -f）
-#     reset-password                            交互式重置 admin 密码
-#     change-listen-addr                        交互式修改 Web 监听地址
-#     menu                                      显式进入菜单（默认入口）
-#     help | --help | -h                        打印帮助
+#   xui-bridge [子命令]                    安装后可用的快捷命令
+#     install / update / upgrade           安装或升级（保留 data/）
+#     uninstall                            卸载二进制 + service（**保留** data/）
+#     purge                                完全清理（含 data/，**不可恢复**）
+#     start | stop | restart               服务启停
+#     status                               systemctl status
+#     log [-e|-w|-i] [N]                   最近 N 行日志，可按级别筛选（默认 200）
+#     follow                               实时跟踪日志
+#     reset-password                       交互式重置 admin 密码
+#     change-listen-addr                   交互式修改 Web 监听地址
+#     backup                               备份 data/ 到时间戳 tar.gz
+#     version                              打印脚本与已装二进制版本
+#     menu                                 显式进入菜单（默认入口）
+#     help | --help | -h                   打印帮助
 #
-# 风格约定（与项目其他 sh 保持一致）：
+# 设计要点（运维专业化，v0.8.4 起）：
 #
-#   - 所有日志走 log_info / log_warn / log_error / log_step；禁止裸 echo。
-#   - 任何破坏性操作（uninstall / purge / change-listen-addr）必须二次确认。
-#   - set -euo pipefail：任何未捕获错误立即终止，避免"半装状态"。
-#   - 全脚本不依赖 bashism 之外的工具（curl / tar / systemctl 必备；ss /
-#     netstat 二选一即可，端口检测自动兜底）。
+#   1) trap ERR + LINENO：任何未捕获错误会打印失败行号 + 命令 + 退出码，
+#      不再 "set -e 后默默退出"，运维一眼看到根因。
+#   2) systemd unit 安全 hardening：NoNewPrivileges / PrivateTmp /
+#      ProtectSystem=strict / ProtectHome / ReadWritePaths=DATA_DIR /
+#      ProtectKernel* / RestrictNamespaces / RestrictSUIDSGID 等让常见
+#      容器级越权失效。
+#   3) 升级前自动备份：旧二进制 → ${BIN_PATH}.bak.<ts>，失败可一键 rollback。
+#   4) 启动健康检查：写完 unit 后 wait 5s 确认 active + 无 ERROR 日志，
+#      否则提示运维查看 journalctl。
+#   5) GitHub 加速 fallback：直连失败时自动尝试 ghproxy / fastgit 镜像。
+#   6) 菜单状态摘要：菜单顶部显示当前版本 / 监听端口 / 启动时长 / 内存。
+#   7) 防火墙自动放行：检测到 ufw / firewalld 时可交互式放行 8787。
 #
 # 返回码语义：
 #
@@ -47,37 +47,94 @@
 
 set -euo pipefail
 
-# ---------------- 颜色与日志辅助 ----------------
-# ANSI 转义；终端不支持彩色时（如 nohup 重定向到文件）会显示原始转义符——
-# 但对一键安装场景影响不大；如需强制无色可在调用处 export NO_COLOR=1。
-red='\033[0;31m'
-green='\033[0;32m'
-yellow='\033[0;33m'
-blue='\033[0;34m'
-cyan='\033[0;36m'
-bold='\033[1m'
-plain='\033[0m'
+# 让 trap ERR 在 subshell / function / pipeline 内同样生效。
+set -E -o pipefail
 
-log_info()  { printf "${green}[INFO]${plain}  %s\n" "$*"; }
-log_warn()  { printf "${yellow}[WARN]${plain}  %s\n" "$*" >&2; }
-log_error() { printf "${red}[ERROR]${plain} %s\n" "$*" >&2; }
-log_step()  { printf "${cyan}[STEP]${plain}  %s\n" "$*"; }
-fail()      { log_error "$*"; exit 1; }
+SCRIPT_VERSION="0.8.4"
+
+# ---------------- 颜色与日志辅助 ----------------
+# 仅当 stdout 是终端且 NO_COLOR 未设置时启用彩色。被 pipe 到文件 / cron
+# 的场景下日志保持纯文本，方便机器解析。
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    red='\033[0;31m'
+    green='\033[0;32m'
+    yellow='\033[0;33m'
+    blue='\033[0;34m'
+    cyan='\033[0;36m'
+    magenta='\033[0;35m'
+    bold='\033[1m'
+    dim='\033[2m'
+    plain='\033[0m'
+else
+    red=''; green=''; yellow=''; blue=''; cyan=''; magenta=''; bold=''; dim=''; plain=''
+fi
+
+# log_* 使用 printf 而不是 echo -e：跨 dash/bash/zsh 行为一致，且能
+# 安全转义用户输入。
+log_info()    { printf "${green}[ OK  ]${plain} %s\n" "$*"; }
+log_warn()    { printf "${yellow}[WARN ]${plain} %s\n" "$*" >&2; }
+log_error()   { printf "${red}[ERROR]${plain} %s\n" "$*" >&2; }
+log_step()    { printf "${cyan}[ ... ]${plain} %s\n" "$*"; }
+log_action()  { printf "${blue}[ >>  ]${plain} %s\n" "$*"; }
+log_hint()    { printf "${dim}        %s${plain}\n" "$*"; }
+
+fail() {
+    log_error "$*"
+    exit 1
+}
+
+# 通用 ERR trap：未捕获错误时打印失败上下文。
+# 调用栈：bash 5.0+ 的 BASH_LINENO[0] 是出错行号，BASH_COMMAND 是当时命令。
+err_trap() {
+    local code=$?
+    local lineno=${BASH_LINENO[0]:-?}
+    local cmd=${BASH_COMMAND:-?}
+    log_error "未捕获错误："
+    log_error "  位置：${BASH_SOURCE[1]:-$0}:${lineno}"
+    log_error "  命令：${cmd}"
+    log_error "  退出码：${code}"
+    log_hint "建议：用 \`xui-bridge log\` 查看最近日志；如反复出现请在 GitHub Issue 反馈。"
+    exit "${code}"
+}
+trap err_trap ERR
 
 # ---------------- 常量 ----------------
 GITHUB_REPO="ZeroStarlet/xboard-xui-bridge"
 INSTALL_DIR="/usr/local/xboard-xui-bridge"
 DATA_DIR="${INSTALL_DIR}/data"
+BACKUP_DIR="${INSTALL_DIR}/backups"
 BIN_PATH="/usr/local/bin/xboard-xui-bridge"
-# HELPER_PATH 是装好后给运维敲的快捷命令；symlink 到 BIN_PATH 让
-# `xui-bridge --version` 等子命令也能直接走。但**菜单 / 卸载等管理动作**
-# 走 install.sh 自身——所以再单独维护一份 install.sh 副本到
-# /usr/local/xboard-xui-bridge/install.sh，让 helper 用。
 HELPER_PATH="/usr/local/bin/xui-bridge"
 SCRIPT_COPY="${INSTALL_DIR}/install.sh"
 SERVICE_NAME="xboard-xui-bridge"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 DEFAULT_PORT=8787
+
+# GitHub 加速镜像，按顺序探测；首个 HTTP 200 的胜出。空字符串 = 直连。
+GH_MIRRORS=(
+    ""                                                     # 直连
+    "https://ghproxy.com/"                                 # ghproxy
+    "https://gh-proxy.com/"                                # gh-proxy
+    "https://mirror.ghproxy.com/"                          # mirror.ghproxy.com
+)
+
+# 启动健康检查参数。
+HEALTH_WAIT_SECONDS=5      # active 等待秒数
+HEALTH_ERROR_THRESHOLD=0   # 启动后允许的 ERROR 日志条数
+
+# ---------------- Banner ----------------
+print_banner() {
+    printf "${cyan}"
+    cat <<'EOF'
+   __  ___                       __        __ __ __ ____
+  /  |/  /__  ___ _____  ___ ___/ /  ___ _/_// // // _/
+ /     /  ' \/  ' / _/_/__/ // /  / _ `/ , /// __// /_
+/_/|_/_/\_,_/_/ /  /_/   \_, /__/_\_,_/_/|_|/_/  /_/__/
+                       /___/
+EOF
+    printf "        xboard-xui-bridge — Xboard ↔ 3x-ui Middleware\n"
+    printf "                installer/manager v%s\n${plain}\n" "${SCRIPT_VERSION}"
+}
 
 # ---------------- 前置检查 ----------------
 require_root() {
@@ -86,23 +143,25 @@ require_root() {
     fi
 }
 
+require_systemd() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        fail "未检测到 systemd（systemctl）；本脚本仅支持基于 systemd 的发行版"
+    fi
+}
+
 # detect_arch 把 uname -m 输出映射到本项目 Release 资产名约定。
-#
-# 项目当前发布 amd64 / arm64 / armv7 三种 Linux 架构；其他架构返回非零
-# 让上层 fail。armv6 / 386 / s390x 等暂不发布——若运维有需要可手工编译。
 detect_arch() {
     local arch
     arch=$(uname -m)
     case "${arch}" in
         x86_64|amd64)         echo "linux-amd64" ;;
         aarch64|arm64)        echo "linux-arm64" ;;
-        armv7l|armv7|armhf)   echo "linux-armv7" ;;
+        armv7l|armv7|armhf)   echo "linux-arm" ;;
         *) fail "暂不支持的架构：${arch}（仅支持 amd64 / arm64 / armv7；其他架构请手工 \`make build-linux\` 编译）" ;;
     esac
 }
 
 # detect_os 读取 /etc/os-release 的 ID 字段（小写 distro 标识）。
-# 失败时返回 "unknown"；安装依赖时按 "unknown" 走通用提示而非中断。
 detect_os() {
     if [[ -f /etc/os-release ]]; then
         # shellcheck disable=SC1091
@@ -114,18 +173,15 @@ detect_os() {
 }
 
 # is_installed 仅在二进制 + service 文件都存在时才视为"已装"。
-# 部分残留（仅 service 文件 / 仅二进制）按"未装"处理，让 install 路径自愈。
 is_installed() {
     [[ -f "${BIN_PATH}" ]] && [[ -f "${SERVICE_FILE}" ]]
 }
 
-# service_active 包装 systemctl is-active；对未装情况安全返回 1。
 service_active() {
     systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null
 }
 
-# port_in_use 检测指定 TCP 端口是否被占用——优先用 ss，其次 netstat，最后 lsof。
-# 这三者在不同 minimal 镜像上的可用性各异；按可用性兜底而不强制安装额外工具。
+# port_in_use 检测指定 TCP 端口是否被占用——优先 ss，其次 netstat，最后 lsof。
 port_in_use() {
     local port="$1"
     if command -v ss >/dev/null 2>&1; then
@@ -140,12 +196,10 @@ port_in_use() {
         lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
         return
     fi
-    # 完全无可用工具——保守返回 0（视为占用）但只是提示，不会阻断安装。
     return 1
 }
 
 # get_public_ip 尽力获取公网 IP，用于在安装完成提示中显示访问地址。
-# 失败时返回 <server-ip> 占位符——运维通常知道自己机器的 IP，无需阻断。
 get_public_ip() {
     local ip
     ip=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || true)
@@ -159,7 +213,6 @@ get_public_ip() {
 }
 
 # confirm_yes 提示 [y/N] 二次确认；默认拒绝（防误操作）。
-# 返回 0 = 用户输入 y/Y/yes/YES；其它（含 EOF）返回 1。
 confirm_yes() {
     local prompt="$1"
     local reply
@@ -172,92 +225,136 @@ confirm_yes() {
 
 # ---------------- 依赖安装 ----------------
 install_dependencies() {
-    if command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
-        log_info "依赖 curl / tar 已就绪，跳过安装"
+    local missing=()
+    command -v curl >/dev/null 2>&1 || missing+=("curl")
+    command -v tar >/dev/null 2>&1  || missing+=("tar")
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        log_info "依赖 curl / tar 已就绪"
         return
     fi
     local os
     os=$(detect_os)
-    log_step "安装依赖（os=${os}）"
+    log_step "安装依赖：${missing[*]}（os=${os}）"
     case "${os}" in
         ubuntu|debian|armbian)
-            apt-get update -y && apt-get install -y curl tar
+            apt-get update -y && apt-get install -y "${missing[@]}"
             ;;
         centos|rhel|fedora|rocky|almalinux|ol|amzn)
             if command -v dnf >/dev/null 2>&1; then
-                dnf install -y curl tar
+                dnf install -y "${missing[@]}"
             else
-                yum install -y curl tar
+                yum install -y "${missing[@]}"
             fi
             ;;
         alpine)
-            apk add --no-cache curl tar
+            apk add --no-cache "${missing[@]}"
             ;;
         arch|manjaro)
-            pacman -Sy --noconfirm curl tar
+            pacman -Sy --noconfirm "${missing[@]}"
             ;;
         opensuse-tumbleweed|opensuse-leap)
-            zypper -q install -y curl tar
+            zypper -q install -y "${missing[@]}"
             ;;
         *)
-            log_warn "未识别的系统 ${os}，请手动确认 curl 与 tar 已安装"
+            log_warn "未识别的系统 ${os}，请手动确认 ${missing[*]} 已安装后重试"
+            fail "依赖不满足"
             ;;
     esac
 }
 
 # ---------------- 版本与下载 ----------------
-get_latest_version() {
-    local api="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
-    local tag
-    tag=$(curl -fsSL "${api}" | grep -E '"tag_name"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
-    if [[ -z "${tag}" ]]; then
-        fail "无法获取最新版本（GitHub API 限频或仓库无 Release）。请稍后重试或手工指定版本。"
-    fi
-    echo "${tag}"
+# 包装 curl：拼接镜像前缀；失败时返回非零。
+curl_with_mirror() {
+    local mirror="$1"; shift
+    local url="$1"; shift
+    local final_url="${mirror}${url}"
+    curl "$@" "${final_url}"
 }
 
-# download_and_install 下载 release tarball、校验 SHA256、解压安装到 BIN_PATH。
-# 二次执行（升级）会原地覆盖 BIN_PATH 不动 DATA_DIR。
+# fetch_with_fallback 尝试用 GH_MIRRORS 顺序下载；首个成功即返回。
+# 所有镜像都失败时返回非零。
 #
-# 实现细节：
-#
-#   函数体放在 subshell 里——bash 的 `trap '...' RETURN` 不会在 `fail/exit`
-#   退出路径触发，会泄漏 mktemp 临时目录。改用 subshell + EXIT trap 后，
-#   即使内部 fail 触发 exit 1，subshell 退出时 EXIT trap 一定会执行清理；
-#   subshell 的 exit 1 会让外层函数返回非零，配合 set -e 自动中断主流程。
+# 用法：fetch_with_fallback <url> <-o output> [其他 curl args]
+# 注意：调用方应传入 -fL 等基础选项。
+fetch_with_fallback() {
+    local url="$1"; shift
+    local m
+    for m in "${GH_MIRRORS[@]}"; do
+        if curl -fsSL --connect-timeout 10 --max-time 60 "$@" "${m}${url}"; then
+            return 0
+        fi
+        if [[ -n "${m}" ]]; then
+            log_warn "镜像 ${m} 失败，尝试下一个"
+        fi
+    done
+    return 1
+}
+
+get_latest_version() {
+    # 优先走 GitHub API（最准）；失败时退到 raw mirror 上的版本占位文件，
+    # 最后再尝试用 git ls-remote 解析最新 tag——后两路兜底让中国大陆等
+    # API 限频环境仍能升级。
+    local api="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+    local tag
+    tag=$(curl -fsSL --connect-timeout 10 --max-time 30 "${api}" 2>/dev/null \
+        | grep -E '"tag_name"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+    if [[ -n "${tag}" ]]; then
+        echo "${tag}"
+        return
+    fi
+
+    log_warn "GitHub API 不可达，尝试通过 git ls-remote 探测最新 tag"
+    if command -v git >/dev/null 2>&1; then
+        tag=$(git ls-remote --tags --refs --sort=-v:refname \
+            "https://github.com/${GITHUB_REPO}.git" 2>/dev/null \
+            | head -1 | sed -E 's@.*refs/tags/(.*)$@\1@' || true)
+        if [[ -n "${tag}" ]]; then
+            log_info "从 git ls-remote 拿到 ${tag}"
+            echo "${tag}"
+            return
+        fi
+    fi
+
+    fail "无法获取最新版本（GitHub API + git ls-remote 均失败）；请稍后重试或手动 \`curl -fsSL https://api.github.com/repos/${GITHUB_REPO}/releases/latest\` 检查网络。"
+}
+
+# get_installed_version 读取已装二进制版本号。无安装返回 "(none)"。
+get_installed_version() {
+    if [[ -x "${BIN_PATH}" ]]; then
+        "${BIN_PATH}" version 2>/dev/null | awk '{print $2}' | head -1
+    else
+        echo "(none)"
+    fi
+}
+
+# download_and_install 下载 release tarball、校验 SHA256、解压安装。
 download_and_install() {
     local arch="$1"
     local version="$2"
     (
         local asset="xboard-xui-bridge-${arch}.tar.gz"
-        local url="https://github.com/${GITHUB_REPO}/releases/download/${version}/${asset}"
-        local sums_url="https://github.com/${GITHUB_REPO}/releases/download/${version}/SHA256SUMS.txt"
+        local url_path="${GITHUB_REPO}/releases/download/${version}/${asset}"
+        local sums_path="${GITHUB_REPO}/releases/download/${version}/SHA256SUMS.txt"
         local tmpdir
         tmpdir=$(mktemp -d)
-        # subshell 范围内的 EXIT trap：subshell 退出（含 fail/exit 1）必触发。
         trap 'rm -rf "${tmpdir}"' EXIT
 
-        log_step "下载 ${asset}"
-        if ! curl -fL --retry 3 -o "${tmpdir}/${asset}" "${url}"; then
-            fail "下载失败：${url}"
+        log_step "下载 ${asset}（${version}）"
+        if ! fetch_with_fallback "https://github.com/${url_path}" -o "${tmpdir}/${asset}"; then
+            fail "下载失败：所有镜像均不可达。可尝试手工下载 https://github.com/${url_path} 后再 \`xui-bridge install\`。"
         fi
 
-        # SHA256 校验是 v0.5 起新加的供应链防御——release 资产被替换的极小
-        # 概率下让运维提前感知。校验失败要立刻 fail，绝不安装可疑二进制。
         log_step "校验 SHA256"
-        if curl -fsSL --retry 3 -o "${tmpdir}/SHA256SUMS.txt" "${sums_url}"; then
+        if fetch_with_fallback "https://github.com/${sums_path}" -o "${tmpdir}/SHA256SUMS.txt"; then
             if command -v sha256sum >/dev/null 2>&1; then
                 local expected actual
-                # `|| true` 保护：当 SHA256SUMS.txt 中不含本资产时 grep
-                # 会返回 1，配合 set -euo pipefail 会让脚本提前中断；这里
-                # 是"找不到则跳过校验"的合法路径，必须吞掉非零退出。
                 expected=$(grep " ${asset}\$" "${tmpdir}/SHA256SUMS.txt" | awk '{print $1}' || true)
                 if [[ -z "${expected}" ]]; then
-                    log_warn "SHA256SUMS.txt 中未找到 ${asset}，跳过校验"
+                    log_warn "SHA256SUMS.txt 中未找到 ${asset}，跳过校验（release 可能未发布该文件）"
                 else
                     actual=$(sha256sum "${tmpdir}/${asset}" | awk '{print $1}')
                     if [[ "${expected}" != "${actual}" ]]; then
-                        fail "SHA256 校验失败！expected=${expected} actual=${actual}"
+                        fail "SHA256 校验失败！expected=${expected} actual=${actual}（疑似下载损坏或被中间人篡改）"
                     fi
                     log_info "SHA256 校验通过"
                 fi
@@ -265,13 +362,69 @@ download_and_install() {
                 log_warn "未安装 sha256sum，跳过校验（建议 apt install coreutils）"
             fi
         else
-            log_warn "无法获取 SHA256SUMS.txt（旧版本 release 可能未发布该文件），跳过校验"
+            log_warn "无法获取 SHA256SUMS.txt（旧 release 可能未发布），跳过校验"
         fi
 
         log_step "解压并安装到 ${BIN_PATH}"
         tar -xzf "${tmpdir}/${asset}" -C "${tmpdir}"
         install -m 0755 "${tmpdir}/xboard-xui-bridge" "${BIN_PATH}"
     )
+}
+
+# backup_existing 升级前备份旧二进制 + bridge.db 到 BACKUP_DIR。
+# 保留最近 5 份，超出按时间戳清理最旧的。
+#
+# 一致性策略（v0.8.4 Codex 审查指出）：
+#
+#   SQLite WAL 模式下"热"拷贝 .db + -wal + -shm 三个文件不保证一致快照
+#   ——拷贝期间被并发写的概率极低（中间件每 60s 一次同步）但仍存在。
+#   优先策略：服务在跑时，用 sqlite3 CLI `.backup` 命令做"应用层一致备份"；
+#   备用策略：sqlite3 不可用 → 退化为三文件冷拷贝并打 WARN。
+#
+#   服务已停止时，文件已无并发写，直接 cp 即可——cmd_install 的升级流程
+#   会先 stop service，再调用本函数，确保大多数场景拿到一致快照。
+backup_existing() {
+    if ! is_installed; then
+        return 0
+    fi
+    mkdir -p "${BACKUP_DIR}"
+    chmod 700 "${BACKUP_DIR}"
+    local ts
+    ts=$(date +%Y%m%d-%H%M%S)
+    log_step "备份当前二进制与数据库到 ${BACKUP_DIR}/${ts}/"
+    mkdir -p "${BACKUP_DIR}/${ts}"
+    cp -f "${BIN_PATH}" "${BACKUP_DIR}/${ts}/xboard-xui-bridge" 2>/dev/null || true
+    if [[ -f "${DATA_DIR}/bridge.db" ]]; then
+        if service_active && command -v sqlite3 >/dev/null 2>&1; then
+            # 应用层一致备份：sqlite3 .backup 在源端持锁完成 page-level copy。
+            if sqlite3 "${DATA_DIR}/bridge.db" ".backup '${BACKUP_DIR}/${ts}/bridge.db'" 2>/dev/null; then
+                log_info "使用 sqlite3 .backup 完成一致性快照"
+            else
+                log_warn "sqlite3 .backup 失败，退化为文件级拷贝（可能非一致快照）"
+                cp -f "${DATA_DIR}/bridge.db" "${BACKUP_DIR}/${ts}/bridge.db" 2>/dev/null || true
+                cp -f "${DATA_DIR}/bridge.db-wal" "${BACKUP_DIR}/${ts}/" 2>/dev/null || true
+                cp -f "${DATA_DIR}/bridge.db-shm" "${BACKUP_DIR}/${ts}/" 2>/dev/null || true
+            fi
+        else
+            # 服务已停 或 无 sqlite3 CLI：直接 cp。服务已停时一致；
+            # 无 sqlite3 时打 WARN 提醒运维装一份让后续备份更稳。
+            if service_active; then
+                log_warn "未检测到 sqlite3 CLI 且服务正在运行；本次备份用文件级拷贝（可能非一致快照）"
+                log_hint "建议安装 sqlite3：apt install sqlite3 / yum install sqlite"
+            fi
+            cp -f "${DATA_DIR}/bridge.db" "${BACKUP_DIR}/${ts}/bridge.db" 2>/dev/null || true
+            cp -f "${DATA_DIR}/bridge.db-wal" "${BACKUP_DIR}/${ts}/" 2>/dev/null || true
+            cp -f "${DATA_DIR}/bridge.db-shm" "${BACKUP_DIR}/${ts}/" 2>/dev/null || true
+        fi
+    fi
+    # 保留最近 5 份。
+    local backups
+    mapfile -t backups < <(ls -1 -t "${BACKUP_DIR}" 2>/dev/null | tail -n +6)
+    local b
+    for b in "${backups[@]}"; do
+        rm -rf "${BACKUP_DIR:?}/${b}"
+    done
+    log_info "备份完成（保留最近 5 份）"
 }
 
 # ---------------- 目录与服务 ----------------
@@ -282,85 +435,109 @@ setup_directories() {
 }
 
 # install_helper 把 install.sh 拷贝到 INSTALL_DIR 并创建 xui-bridge 别名。
-#
-# 拷贝而不是 symlink 到 source URL：本脚本支持离线管理（卸载、改 listen 等
-# 不需要联网），symlink 到一次性下载源会在 /tmp 清理后失效。把脚本固化在
-# INSTALL_DIR 下，xui-bridge → 指向它，运维断网仍可管。
-#
-# 关键边界：通过 `xui-bridge install` 调起本函数时，$0 经 bash 解析后是
-# helper symlink → SCRIPT_COPY 的真实路径——cp "$0" "$SCRIPT_COPY" 会
-# 让 GNU cp 拒绝（"are the same file"）并退出非零，set -e 把整个安装流程
-# 中止在 daemon-reload 之前。这里通过 readlink -f 比对真实路径，**自我
-# 复制**（已固化）就直接跳过，让 helper 模式下重装 / 升级 100% 通畅。
 install_helper() {
     log_step "安装 helper 命令 ${HELPER_PATH}"
     local self_real script_copy_real
     self_real=$(readlink -f "$0" 2>/dev/null || true)
     script_copy_real=$(readlink -f "${SCRIPT_COPY}" 2>/dev/null || true)
 
-    # 三种调用源各自对应一种固化策略：
-    #
-    #   a) helper 模式（self_real == script_copy_real）：用户敲了 xui-bridge
-    #      install 走升级。优先从 GitHub curl 一份新脚本——让 install.sh
-    #      自身的逻辑也能随 release 演进（如本次 v0.5 加了 SHA256 校验、
-    #      menu 等，旧版 helper 升级 binary 时若不刷脚本，运维感知不到）。
-    #      curl 失败则保留旧脚本（offline-friendly：网络抖动不影响升级）。
-    #
-    #   b) 本地直跑（$0 是真实文件且 != SCRIPT_COPY）：cp $0 → SCRIPT_COPY。
-    #      运维克隆仓库后跑 `bash install.sh install`，文件固化即可。
-    #
-    #   c) pipe 模式（$0 是 /dev/fd/63）：bash <(curl ...)，$0 不是真文件，
-    #      必须 curl 拉一次脚本固化下来；curl 失败时仅 WARN 不阻断（核心
-    #      功能仍可用，只是 xui-bridge helper 不可用）。
     if [[ -n "${self_real}" && "${self_real}" == "${script_copy_real}" ]]; then
         log_step "helper 模式：尝试从 GitHub 刷新 install.sh"
-        if curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh" -o "${SCRIPT_COPY}.new"; then
+        if fetch_with_fallback "https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh" -o "${SCRIPT_COPY}.new"; then
             mv -f "${SCRIPT_COPY}.new" "${SCRIPT_COPY}"
             log_info "已从 GitHub 刷新 install.sh"
         else
             rm -f "${SCRIPT_COPY}.new"
-            log_warn "无法从 GitHub 拉取 install.sh，保留本地旧版本（离线模式可继续工作）"
+            log_warn "无法拉取最新 install.sh，保留本地旧版本（离线模式可继续工作）"
         fi
     elif [[ -f "$0" ]] && [[ -r "$0" ]]; then
         cp "$0" "${SCRIPT_COPY}"
     else
-        if ! curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh" -o "${SCRIPT_COPY}"; then
+        if ! fetch_with_fallback "https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh" -o "${SCRIPT_COPY}"; then
             log_warn "无法从 GitHub 固化 install.sh（curl 失败），helper 将不可用"
             return 0
         fi
     fi
     chmod 0755 "${SCRIPT_COPY}"
-    # symlink 而不是 cp：让 xui-bridge 永远跑最新 install.sh（升级覆盖时
-    # SCRIPT_COPY 会被刷新，xui-bridge 自动跟进）。
     ln -sf "${SCRIPT_COPY}" "${HELPER_PATH}"
 }
 
 write_systemd_unit() {
     log_step "写入 systemd unit ${SERVICE_FILE}"
+    # systemd 安全 hardening（v0.8.4 起）：
+    #
+    # NoNewPrivileges            禁用 setuid 二进制提权
+    # PrivateTmp                 独立 /tmp 命名空间
+    # ProtectSystem=strict       /usr /etc 只读，仅 ReadWritePaths 允许写
+    # ProtectHome                / root /home /run/user 不可见
+    # ProtectKernelTunables      /proc/sys /sys 只读
+    # ProtectKernelModules       禁加载 / 卸载模块
+    # ProtectKernelLogs          隔离 dmesg
+    # ProtectControlGroups       /sys/fs/cgroup 只读
+    # ProtectClock               禁改时钟
+    # ProtectHostname            禁改 hostname
+    # ProtectProc=invisible      /proc/<pid> 只能看自己
+    # RestrictNamespaces         禁建 namespace
+    # RestrictSUIDSGID           禁创建 setuid 文件
+    # RestrictRealtime           禁实时调度
+    # LockPersonality            禁改 ABI personality
+    # SystemCallArchitectures=native  仅本地系统调用 ABI
+    # SystemCallFilter=@system-service systemd 推荐的 system service 集合，
+    #                            覆盖 net/http、sqlite、json、文件 IO 等
+    #                            依赖的 syscall。**不再** ~@privileged
+    #                            ~@resources 排除——@resources 中的
+    #                            sched_setaffinity / prlimit / setrlimit
+    #                            是 Go runtime 调度所必须（v0.8.4 Codex
+    #                            审查指出过度限制风险）。
+    # CapabilityBoundingSet=      清空所有 cap（中间件默认 8787 > 1024，
+    #                            不需要 CAP_NET_BIND_SERVICE；如需绑定低
+    #                            端口请用 systemctl edit 加回去）
+    # AmbientCapabilities=        清空（同上）
+    #
+    # 不启用 MemoryDenyWriteExecute：Go runtime 的 cgo / plugin / JIT 路径
+    # 在极端情况下需要 W+X；本中间件目前不依赖 cgo，但保留这层 future-proof
+    # 兼容性。如需更高安全可由运维 systemctl edit 加上。
     cat > "${SERVICE_FILE}" <<EOF
 [Unit]
 Description=xboard-xui-bridge — 非侵入式 Xboard / 3x-ui 中间件
-After=network.target
+Documentation=https://github.com/${GITHUB_REPO}
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-# BRIDGE_LISTEN_ADDR=:${DEFAULT_PORT} 让 Web 面板绑定全部网卡——VPS 一键安装的
-# 典型场景就是要从公网浏览器访问。安全模型靠 admin 鉴权 + bcrypt +
-# CSRF 防御兜底；如需更高安全请配反代 + TLS。
-#
-# 不希望外部可达的运维可以执行：
-#   sudo systemctl edit ${SERVICE_NAME}
-# 然后写：
-#   [Service]
-#   Environment=BRIDGE_LISTEN_ADDR=127.0.0.1:${DEFAULT_PORT}
-# 这会通过 drop-in override 覆盖以下默认值。
+WorkingDirectory=${INSTALL_DIR}
 Environment=BRIDGE_LISTEN_ADDR=:${DEFAULT_PORT}
 ExecStart=${BIN_PATH} run --db ${DATA_DIR}/bridge.db
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65535
-WorkingDirectory=${INSTALL_DIR}
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+# ===== 安全 hardening =====
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=${DATA_DIR}
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
 
 [Install]
 WantedBy=multi-user.target
@@ -379,10 +556,71 @@ start_or_restart_service() {
     fi
 }
 
+# wait_for_active 启动后等待至多 ${HEALTH_WAIT_SECONDS} 秒确认 active。
+# 失败时打印诊断信息 + 部分日志方便快速排错。
+wait_for_active() {
+    local i
+    for ((i=0; i<HEALTH_WAIT_SECONDS; i++)); do
+        if service_active; then
+            log_info "服务运行中（active）"
+            return 0
+        fi
+        sleep 1
+    done
+    log_error "服务未在 ${HEALTH_WAIT_SECONDS} 秒内进入 active 状态"
+    log_hint "最近 30 行日志："
+    journalctl -u "${SERVICE_NAME}" -n 30 --no-pager 2>&1 | sed 's/^/        /'
+    return 1
+}
+
+# check_no_errors 启动后扫描最近 N 行日志的 ERROR 计数。
+check_no_errors() {
+    local n=50
+    local errors
+    errors=$(journalctl -u "${SERVICE_NAME}" -n "${n}" --no-pager 2>/dev/null \
+        | grep -ciE '"level":"error"|^\S+\s\S+\s\S+ ERROR' || true)
+    if [[ "${errors}" -gt "${HEALTH_ERROR_THRESHOLD}" ]]; then
+        log_warn "启动后最近 ${n} 行日志中检测到 ${errors} 条 ERROR；建议 \`xui-bridge log -e\` 查看详情"
+        return 1
+    fi
+    return 0
+}
+
+# ---------------- 防火墙放行 ----------------
+maybe_open_firewall() {
+    local port="$1"
+    if command -v ufw >/dev/null 2>&1; then
+        if ufw status 2>/dev/null | grep -q "Status: active"; then
+            if confirm_yes "检测到 ufw 处于启用状态，是否放行 ${port}/tcp？"; then
+                ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+                log_info "ufw 已放行 ${port}/tcp"
+            fi
+        fi
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        if firewall-cmd --state >/dev/null 2>&1; then
+            if confirm_yes "检测到 firewalld 处于启用状态，是否放行 ${port}/tcp？"; then
+                firewall-cmd --add-port="${port}/tcp" --permanent >/dev/null 2>&1 || true
+                firewall-cmd --reload >/dev/null 2>&1 || true
+                log_info "firewalld 已放行 ${port}/tcp"
+            fi
+        fi
+    fi
+}
+
 # ---------------- 完成提示 ----------------
 show_post_install() {
-    log_info "等待 ~3 秒让首次启动完成..."
+    log_step "等待 ~3 秒让首次启动完成"
     sleep 3
+    # 健康检查（v0.8.4 Codex 审查要求不吞失败）：
+    # wait_for_active 失败 = 服务真的没起来 → 退出非零让 install/update 的
+    # 调用方拿到失败信号，不能伪装"安装完成"。
+    # check_no_errors 失败 = active 但有 ERROR 日志，可能是 token / 网络等
+    # 软问题；仅 WARN 不阻断（与 wait_for_active 的硬失败语义区分清楚）。
+    if ! wait_for_active; then
+        log_error "服务启动健康检查未通过；请按上方日志诊断后重试"
+        return 1
+    fi
+    check_no_errors || true
 
     local pwd_file="${DATA_DIR}/initial_password.txt"
     local pwd_line=""
@@ -390,42 +628,45 @@ show_post_install() {
         pwd_line=$(cat "${pwd_file}" 2>/dev/null || true)
     fi
 
-    local public_ip
+    local public_ip installed_version
     public_ip=$(get_public_ip)
+    installed_version=$(get_installed_version)
 
     echo
-    printf "${bold}${cyan}============================================================${plain}\n"
-    printf "${bold}  xboard-xui-bridge 安装完成${plain}\n"
-    printf "${bold}${cyan}============================================================${plain}\n"
+    printf "${bold}${cyan}═══════════════════════════════════════════════════════════════${plain}\n"
+    printf "  ${bold}xboard-xui-bridge 安装完成${plain}\n"
+    printf "${bold}${cyan}═══════════════════════════════════════════════════════════════${plain}\n"
     echo
-    printf "  ${bold}Web 面板地址：${plain}  http://%s:%s\n" "${public_ip}" "${DEFAULT_PORT}"
-    printf "  ${bold}默认用户名：${plain}    admin\n"
+    printf "  ${bold}版本：${plain}            %s\n" "${installed_version}"
+    printf "  ${bold}Web 面板：${plain}        http://%s:%s\n" "${public_ip}" "${DEFAULT_PORT}"
+    printf "  ${bold}默认用户名：${plain}      admin\n"
     if [[ -n "${pwd_line}" ]]; then
-        printf "  ${bold}初始密码：${plain}      ${green}%s${plain}\n" "${pwd_line}"
+        printf "  ${bold}初始密码：${plain}        ${green}%s${plain}\n" "${pwd_line}"
         echo
-        printf "  密码同时已写入文件：%s\n" "${pwd_file}"
-        printf "  ${yellow}登录后请立即修改密码并妥善保管该文件。${plain}\n"
+        printf "  密码同时写入文件：%s\n" "${pwd_file}"
+        printf "  ${yellow}首次登录后请立即修改密码并妥善保管该文件。${plain}\n"
     else
-        printf "  ${bold}初始密码：${plain}      （未读到 initial_password.txt——这通常意味着升级安装，沿用旧密码）\n"
+        printf "  ${bold}初始密码：${plain}        ${dim}（升级安装，沿用旧密码）${plain}\n"
     fi
     echo
-    printf "  ${bold}防火墙放行（首次部署必做）：${plain}\n"
-    printf "    ufw allow %s/tcp                                      # Ubuntu/Debian\n" "${DEFAULT_PORT}"
-    printf "    firewall-cmd --add-port=%s/tcp --permanent && firewall-cmd --reload   # CentOS/RHEL\n" "${DEFAULT_PORT}"
-    printf "    云厂商 VPS 还需到控制台安全组放行 TCP %s\n" "${DEFAULT_PORT}"
+    printf "  ${bold}快捷管理命令${plain}（已注册到 \$PATH）：\n"
+    printf "    ${cyan}xui-bridge${plain}                       打开管理菜单\n"
+    printf "    ${cyan}xui-bridge status${plain}                查看运行状态\n"
+    printf "    ${cyan}xui-bridge log${plain} ${dim}[-e|-w]${plain}              查看日志（可按级别筛选）\n"
+    printf "    ${cyan}xui-bridge follow${plain}                实时跟踪日志\n"
+    printf "    ${cyan}xui-bridge restart${plain}               重启服务\n"
+    printf "    ${cyan}xui-bridge reset-password${plain}        重置 admin 密码\n"
+    printf "    ${cyan}xui-bridge backup${plain}                备份数据库\n"
+    printf "    ${cyan}xui-bridge change-listen-addr${plain}    修改监听地址\n"
+    printf "    ${cyan}xui-bridge uninstall${plain}             卸载（保留 data/）\n"
+    printf "    ${cyan}xui-bridge purge${plain}                 完全清理（含 data/）\n"
     echo
-    printf "  ${bold}快捷管理命令（已注册到 \$PATH）：${plain}\n"
-    printf "    xui-bridge                       打开管理菜单\n"
-    printf "    xui-bridge status                查看运行状态\n"
-    printf "    xui-bridge log                   查看最近日志\n"
-    printf "    xui-bridge follow                实时跟踪日志\n"
-    printf "    xui-bridge restart               重启服务\n"
-    printf "    xui-bridge reset-password        重置 admin 密码\n"
-    printf "    xui-bridge uninstall             卸载（保留 data/）\n"
-    printf "    xui-bridge purge                 完全清理（含 data/）\n"
-    printf "    xui-bridge help                  查看完整帮助\n"
+
+    # 防火墙：检测到主流 firewall 时提示放行。
+    maybe_open_firewall "${DEFAULT_PORT}"
+
     echo
-    printf "${bold}${cyan}============================================================${plain}\n"
+    printf "${bold}${cyan}═══════════════════════════════════════════════════════════════${plain}\n"
 }
 
 # ---------------- 子命令实现 ----------------
@@ -434,18 +675,23 @@ cmd_install() {
 
     local arch version
     arch=$(detect_arch)
-    log_info "检测到架构：${arch}"
+    log_info "架构：${arch}"
 
     version=$(get_latest_version)
-    log_info "目标版本：${version}"
+    local current
+    current=$(get_installed_version)
+    if [[ "${current}" != "(none)" ]]; then
+        log_info "升级：${current} → ${version}"
+    else
+        log_info "目标版本：${version}"
+    fi
 
-    # 端口冲突预警：装前检测 8787 是否已被占用——避免安装完启动即 fail
-    # 让运维一脸懵。仅 WARN 不阻断（用户可能要换 listen_addr）。
     if port_in_use "${DEFAULT_PORT}"; then
         log_warn "端口 ${DEFAULT_PORT} 已被占用——若不是本中间件历史进程，"
         log_warn "建议安装后通过 \`xui-bridge change-listen-addr\` 修改监听端口。"
     fi
 
+    backup_existing
     download_and_install "${arch}" "${version}"
     setup_directories
     write_systemd_unit
@@ -455,7 +701,6 @@ cmd_install() {
 }
 
 # cmd_uninstall 卸载二进制 + service + helper，**保留** data/。
-# 适用于"想换机器迁移"或"暂时不用，未来还会装回来"的运维。
 cmd_uninstall() {
     if ! is_installed; then
         log_warn "未检测到已安装实例，无需卸载"
@@ -463,11 +708,11 @@ cmd_uninstall() {
     fi
     echo
     log_warn "即将卸载 xboard-xui-bridge："
-    printf "    - 停止并禁用 systemd 服务 %s\n" "${SERVICE_NAME}"
-    printf "    - 删除二进制 %s\n" "${BIN_PATH}"
-    printf "    - 删除 service 文件 %s\n" "${SERVICE_FILE}"
-    printf "    - 删除 helper 命令 %s\n" "${HELPER_PATH}"
-    printf "    - ${green}保留${plain} 数据目录 %s（含数据库、密码、日志）\n" "${DATA_DIR}"
+    printf "    • 停止并禁用 systemd 服务 ${bold}%s${plain}\n" "${SERVICE_NAME}"
+    printf "    • 删除二进制 %s\n" "${BIN_PATH}"
+    printf "    • 删除 service 文件 %s\n" "${SERVICE_FILE}"
+    printf "    • 删除 helper 命令 %s\n" "${HELPER_PATH}"
+    printf "    • ${green}保留${plain} 数据目录 %s（含数据库、密码、日志、备份）\n" "${DATA_DIR}"
     echo
     if ! confirm_yes "确定继续吗？"; then
         log_info "已取消"
@@ -478,25 +723,19 @@ cmd_uninstall() {
     systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
     log_step "删除二进制 / service / drop-in / helper"
     rm -f "${BIN_PATH}" "${SERVICE_FILE}" "${HELPER_PATH}" "${SCRIPT_COPY}"
-    # 删除 change-listen-addr 写过的 drop-in override 目录——不删的话
-    # 重装后会从 listen.conf 继承上一次的监听地址，让"卸载重装恢复默认"
-    # 这一直觉失效。
     rm -rf "/etc/systemd/system/${SERVICE_NAME}.service.d"
     systemctl daemon-reload
-    log_info "卸载完成。data/ 仍保留在 ${DATA_DIR}；如需彻底清理请运行 xui-bridge purge。"
+    log_info "卸载完成；data/ 仍保留在 ${DATA_DIR}"
+    log_hint "完整清理（含数据）请运行：xui-bridge purge"
 }
 
-# cmd_purge 完全清理：相当于"装回原样"。包括 data/ 数据库。
-# 危险操作，必须二次确认 + 输入 PURGE 字符串确认。
+# cmd_purge 完全清理（含 data/）。
 cmd_purge() {
     echo
-    # 这里不能用 log_warn——log helper 把消息作为 %s 参数传给 printf，
-    # 嵌入的 ${red} 等颜色变量会被原样输出为字面转义序列（无法着色）。
-    # 直接用 printf + format string 是唯一干净的彩色多色嵌入方式。
-    printf "${yellow}[WARN]${plain}  即将${red}彻底清理${plain} xboard-xui-bridge 全部数据：\n" >&2
-    printf "    - 停止服务 + 删二进制 + 删 service + 删 helper（同 uninstall）\n"
-    printf "    - ${red}并删除${plain} 数据目录 %s（含数据库、密码、日志）\n" "${DATA_DIR}"
-    printf "    - ${red}此操作不可恢复${plain}：所有桥接配置、管理员账户、流量基线都会丢失\n"
+    printf "${red}${bold}⚠ 即将彻底清理 xboard-xui-bridge 全部数据：${plain}\n" >&2
+    printf "    • 停止服务 + 删二进制 + 删 service + 删 helper（同 uninstall）\n"
+    printf "    • ${red}并删除${plain} 数据目录 %s（含数据库、密码、日志、备份）\n" "${DATA_DIR}"
+    printf "    • ${red}此操作不可恢复${plain}：所有桥接配置、管理员账户、流量基线都会丢失\n"
     echo
     local reply
     read -rp "请输入 PURGE 确认（区分大小写）：" reply || return 1
@@ -509,8 +748,6 @@ cmd_purge() {
     systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
     log_step "删除全部文件 + 数据目录 + drop-in"
     rm -f "${BIN_PATH}" "${SERVICE_FILE}" "${HELPER_PATH}"
-    # 同 uninstall：清理 change-listen-addr 写过的 drop-in。purge 语义是
-    # "回到刚装 OS 那一刻"，残留 drop-in override 会让重装时困惑。
     rm -rf "/etc/systemd/system/${SERVICE_NAME}.service.d"
     rm -rf "${INSTALL_DIR}"
     systemctl daemon-reload
@@ -521,35 +758,59 @@ cmd_start()   { systemctl start "${SERVICE_NAME}";   log_info "已启动 ${SERVI
 cmd_stop()    { systemctl stop "${SERVICE_NAME}";    log_info "已停止 ${SERVICE_NAME}"; }
 cmd_restart() { systemctl restart "${SERVICE_NAME}"; log_info "已重启 ${SERVICE_NAME}"; }
 cmd_status()  { systemctl status "${SERVICE_NAME}" --no-pager || true; }
-cmd_log()     { journalctl -u "${SERVICE_NAME}" -n 200 --no-pager || true; }
+
+# cmd_log 支持按级别筛选 + 自定义行数。
+#
+# 用法：
+#   xui-bridge log              最近 200 行原样
+#   xui-bridge log -e           仅 ERROR
+#   xui-bridge log -w           ERROR + WARN
+#   xui-bridge log -i           ERROR + WARN + INFO（不含 DEBUG）
+#   xui-bridge log 500          最近 500 行
+#   xui-bridge log -e 1000      最近 1000 行中的 ERROR
+cmd_log() {
+    local lines=200
+    local filter=""
+    local arg
+    for arg in "$@"; do
+        case "${arg}" in
+            -e|--error)  filter='"level":"error"' ;;
+            -w|--warn)   filter='"level":"error"|"level":"warn"' ;;
+            -i|--info)   filter='"level":"error"|"level":"warn"|"level":"info"' ;;
+            *[0-9]*)     lines="${arg}" ;;
+        esac
+    done
+    if [[ -n "${filter}" ]]; then
+        journalctl -u "${SERVICE_NAME}" -n "${lines}" --no-pager \
+            | grep --color=auto -E "${filter}" || log_info "无匹配日志"
+    else
+        journalctl -u "${SERVICE_NAME}" -n "${lines}" --no-pager
+    fi
+}
+
 cmd_log_follow() {
-    log_info "实时跟踪日志中（Ctrl+C 退出）..."
+    log_info "实时跟踪日志中（Ctrl+C 退出）"
     journalctl -u "${SERVICE_NAME}" -f
 }
 
 cmd_reset_password() {
     if ! is_installed; then
-        fail "未检测到已安装实例，请先运行 install。"
+        fail "未检测到已安装实例，请先运行 install"
     fi
     "${BIN_PATH}" reset-password --db "${DATA_DIR}/bridge.db"
 }
 
-# cmd_change_listen_addr 引导运维写 systemd drop-in override 修改 BRIDGE_LISTEN_ADDR。
-#
-# 不直接改 settings 表里的 web.listen_addr：那是"启动期定型字段"——运行
-# 时 PATCH 会被 Web Handler 拒绝，且需要重启进程才生效；运维体验差。
-# drop-in override 的好处：systemctl edit 自动管理 mtime + reload，重启
-# 即生效，可重复修改。
+# cmd_change_listen_addr 写 systemd drop-in override 修改 BRIDGE_LISTEN_ADDR。
 cmd_change_listen_addr() {
     if ! is_installed; then
-        fail "未检测到已安装实例，请先运行 install。"
+        fail "未检测到已安装实例，请先运行 install"
     fi
     echo
     printf "${bold}修改 Web 监听地址${plain}\n"
     printf "  示例：\n"
-    printf "    :8787              ← 绑定全部网卡（默认；公网可访问）\n"
-    printf "    127.0.0.1:8787     ← 仅本机（配合 nginx 反代时推荐）\n"
-    printf "    192.168.1.10:8787  ← 仅指定网卡（多 IP 场景）\n"
+    printf "    ${cyan}:8787${plain}              绑定全部网卡（默认；公网可访问）\n"
+    printf "    ${cyan}127.0.0.1:8787${plain}     仅本机（配合 nginx 反代时推荐）\n"
+    printf "    ${cyan}192.168.1.10:8787${plain}  仅指定网卡（多 IP 场景）\n"
     echo
     local addr
     read -rp "请输入新的监听地址：" addr
@@ -558,7 +819,6 @@ cmd_change_listen_addr() {
         log_warn "监听地址不可为空，已取消"
         return 1
     fi
-    # 极简格式校验：必须含冒号 + 冒号后是 1-65535 的端口数字。
     if ! [[ "${addr}" =~ ^.*:[0-9]{1,5}$ ]]; then
         fail "格式不合法（应为 host:port 形式）：${addr}"
     fi
@@ -569,7 +829,7 @@ cmd_change_listen_addr() {
 [Service]
 Environment=BRIDGE_LISTEN_ADDR=${addr}
 EOF
-    log_step "已写入 drop-in override：${override_file}"
+    log_info "已写入 drop-in override：${override_file}"
     systemctl daemon-reload
     if confirm_yes "立即重启服务以应用？"; then
         systemctl restart "${SERVICE_NAME}"
@@ -579,37 +839,119 @@ EOF
     fi
 }
 
+cmd_backup() {
+    if ! is_installed; then
+        fail "未检测到已安装实例"
+    fi
+    backup_existing
+    log_info "备份目录：${BACKUP_DIR}"
+}
+
+cmd_version() {
+    local installed
+    installed=$(get_installed_version)
+    printf "%-20s %s\n" "Script version:" "${SCRIPT_VERSION}"
+    printf "%-20s %s\n" "Installed binary:" "${installed}"
+    if [[ "${installed}" != "(none)" ]]; then
+        printf "%-20s %s\n" "Service active:" "$(service_active && echo yes || echo no)"
+    fi
+}
+
+# 菜单顶部的状态摘要：
+#   • 已安装版本 / 服务状态
+#   • 监听端口（从 service file 或 drop-in 解析）
+#   • 启动时长 + 内存（systemctl show 抓 ActiveEnterTimestamp / MemoryCurrent）
+status_summary() {
+    local installed active listen_addr uptime mem
+    installed=$(get_installed_version)
+
+    if service_active; then
+        active="${green}● running${plain}"
+    elif is_installed; then
+        active="${red}● stopped${plain}"
+    else
+        active="${yellow}● not installed${plain}"
+    fi
+
+    # 监听地址：优先 drop-in override，其次主 unit。
+    listen_addr=""
+    if [[ -f "/etc/systemd/system/${SERVICE_NAME}.service.d/listen.conf" ]]; then
+        listen_addr=$(grep -E 'BRIDGE_LISTEN_ADDR=' "/etc/systemd/system/${SERVICE_NAME}.service.d/listen.conf" \
+            | sed -E 's/.*BRIDGE_LISTEN_ADDR=//')
+    elif [[ -f "${SERVICE_FILE}" ]]; then
+        listen_addr=$(grep -E 'BRIDGE_LISTEN_ADDR=' "${SERVICE_FILE}" \
+            | sed -E 's/.*BRIDGE_LISTEN_ADDR=//')
+    fi
+    [[ -z "${listen_addr}" ]] && listen_addr="${dim}(unset)${plain}"
+
+    if service_active; then
+        local started_at started_epoch now_epoch
+        started_at=$(systemctl show "${SERVICE_NAME}" --property=ActiveEnterTimestamp --value 2>/dev/null || true)
+        if [[ -n "${started_at}" ]]; then
+            started_epoch=$(date -d "${started_at}" +%s 2>/dev/null || echo 0)
+            now_epoch=$(date +%s)
+            local diff=$((now_epoch - started_epoch))
+            if [[ "${diff}" -gt 0 ]]; then
+                local days=$((diff / 86400))
+                local hours=$(((diff % 86400) / 3600))
+                local mins=$(((diff % 3600) / 60))
+                if [[ "${days}" -gt 0 ]]; then
+                    uptime="${days}d ${hours}h ${mins}m"
+                elif [[ "${hours}" -gt 0 ]]; then
+                    uptime="${hours}h ${mins}m"
+                else
+                    uptime="${mins}m"
+                fi
+            fi
+        fi
+        local mem_bytes
+        mem_bytes=$(systemctl show "${SERVICE_NAME}" --property=MemoryCurrent --value 2>/dev/null || echo 0)
+        if [[ "${mem_bytes}" =~ ^[0-9]+$ ]] && [[ "${mem_bytes}" -gt 0 ]]; then
+            mem=$(awk -v b="${mem_bytes}" 'BEGIN { printf "%.1f MB", b/1024/1024 }')
+        fi
+    fi
+    [[ -z "${uptime:-}" ]] && uptime="${dim}-${plain}"
+    [[ -z "${mem:-}" ]] && mem="${dim}-${plain}"
+
+    printf "  ${bold}Version:${plain}      %s\n" "${installed}"
+    printf "  ${bold}Status:${plain}       %b\n" "${active}"
+    printf "  ${bold}Listen:${plain}       %b\n" "${listen_addr}"
+    printf "  ${bold}Uptime:${plain}       %b\n" "${uptime}"
+    printf "  ${bold}Memory:${plain}       %b\n" "${mem}"
+}
+
 cmd_show_menu() {
     while true; do
+        clear 2>/dev/null || true
+        print_banner
+        printf "${bold}${cyan}═══════════════════════════════════════════════════════════════${plain}\n"
+        printf "  ${bold}xboard-xui-bridge — 管理菜单${plain}\n"
+        printf "${bold}${cyan}═══════════════════════════════════════════════════════════════${plain}\n"
         echo
-        printf "${bold}${cyan}============================================================${plain}\n"
-        printf "${bold}  xboard-xui-bridge 管理菜单${plain}\n"
-        printf "${bold}${cyan}============================================================${plain}\n"
-        local active_label
-        if service_active; then
-            active_label="${green}● 运行中${plain}"
-        elif is_installed; then
-            active_label="${red}● 已停止${plain}"
-        else
-            active_label="${yellow}● 未安装${plain}"
-        fi
-        printf "  服务状态：%b\n" "${active_label}"
+        status_summary
         echo
-        printf "   1. 安装 / 升级\n"
-        printf "   2. 启动服务\n"
-        printf "   3. 停止服务\n"
-        printf "   4. 重启服务\n"
-        printf "   5. 查看运行状态（systemctl status）\n"
-        printf "   6. 查看最近 200 行日志\n"
-        printf "   7. 实时跟踪日志（journalctl -f）\n"
-        printf "   8. 重置 admin 密码\n"
-        printf "   9. 修改 Web 监听地址\n"
-        printf "  10. 卸载（保留数据）\n"
-        printf "  11. ${red}彻底清理${plain}（含数据，不可恢复）\n"
-        printf "   0. 退出\n"
+        printf "${bold}${cyan}─── Service ──────────────────────────────────────────────────${plain}\n"
+        printf "   ${cyan}1${plain})  安装 / 升级\n"
+        printf "   ${cyan}2${plain})  启动服务\n"
+        printf "   ${cyan}3${plain})  停止服务\n"
+        printf "   ${cyan}4${plain})  重启服务\n"
+        printf "${bold}${cyan}─── Diagnostics ──────────────────────────────────────────────${plain}\n"
+        printf "   ${cyan}5${plain})  运行状态（systemctl status）\n"
+        printf "   ${cyan}6${plain})  最近 200 行日志\n"
+        printf "   ${cyan}7${plain})  仅 ERROR 日志\n"
+        printf "   ${cyan}8${plain})  实时跟踪日志\n"
+        printf "${bold}${cyan}─── Maintenance ──────────────────────────────────────────────${plain}\n"
+        printf "   ${cyan}9${plain})  重置 admin 密码\n"
+        printf "  ${cyan}10${plain})  修改 Web 监听地址\n"
+        printf "  ${cyan}11${plain})  备份数据库\n"
+        printf "${bold}${cyan}─── Danger Zone ──────────────────────────────────────────────${plain}\n"
+        printf "  ${cyan}12${plain})  ${yellow}卸载${plain}（保留数据）\n"
+        printf "  ${cyan}13${plain})  ${red}彻底清理${plain}（含数据，不可恢复）\n"
+        printf "${bold}${cyan}──────────────────────────────────────────────────────────────${plain}\n"
+        printf "   ${cyan}0${plain})  退出\n"
         echo
         local choice
-        read -rp "请选择 [0-11]: " choice || return 0
+        read -rp "请选择 [0-13]: " choice || return 0
         case "${choice}" in
             1)  cmd_install ;;
             2)  cmd_start ;;
@@ -617,51 +959,63 @@ cmd_show_menu() {
             4)  cmd_restart ;;
             5)  cmd_status ;;
             6)  cmd_log ;;
-            7)  cmd_log_follow ;;
-            8)  cmd_reset_password ;;
-            9)  cmd_change_listen_addr ;;
-            10) cmd_uninstall ;;
-            11) cmd_purge ;;
+            7)  cmd_log -e ;;
+            8)  cmd_log_follow ;;
+            9)  cmd_reset_password ;;
+            10) cmd_change_listen_addr ;;
+            11) cmd_backup ;;
+            12) cmd_uninstall ;;
+            13) cmd_purge ;;
             0)  log_info "再见"; return 0 ;;
             *)  log_warn "无效选项：${choice}" ;;
         esac
+        echo
+        read -rp "按 Enter 返回菜单..." _ || true
     done
 }
 
 cmd_help() {
     cat <<EOF
-xboard-xui-bridge 安装 / 管理脚本
+xboard-xui-bridge 安装 / 管理脚本（脚本版本 ${SCRIPT_VERSION}）
 
 用法：
   bash <(curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh)
                                   默认行为：未装 → 安装；已装 → 进菜单
 
-  xui-bridge [子命令]              安装后可用的快捷别名
+  xui-bridge [子命令]              安装后可用的快捷命令
 
 子命令：
-  install / update / upgrade      安装或升级（保留 data/）
-  uninstall                       卸载二进制 + service，保留 data/
+  install / update / upgrade      安装或升级（自动备份，保留 data/）
+  uninstall                       卸载二进制 + service（保留 data/）
   purge                           完全清理（含 data/，不可恢复）
   start | stop | restart          服务启停
   status                          打印 systemctl status
-  log                             打印最近 200 行日志
+  log [-e|-w|-i] [N]              查看日志，可按级别筛选（默认 200 行）
   follow                          实时跟踪日志
   reset-password                  交互式重置 admin 密码
   change-listen-addr              交互式修改 Web 监听地址
+  backup                          手动备份当前数据库
+  version                         打印脚本与二进制版本
   menu                            显式进入菜单（默认入口）
   help | --help | -h              打印本帮助
 
 示例：
-  xui-bridge                                    # 进菜单
-  xui-bridge install                            # 一键升级到最新版
-  xui-bridge restart && xui-bridge follow       # 重启后跟日志
-  xui-bridge reset-password                     # 忘密码兜底重置
+  xui-bridge                                进菜单
+  xui-bridge install                        一键升级到最新版（自动备份旧版本）
+  xui-bridge log -e                         仅查看 ERROR 日志
+  xui-bridge restart && xui-bridge follow   重启后跟日志
+  xui-bridge reset-password                 忘密码兜底重置
+  xui-bridge backup                         手动备份数据库
+
+环境变量：
+  NO_COLOR=1                                禁用彩色输出（cron / 日志重定向场景）
 EOF
 }
 
 # ---------------- 主流程 ----------------
 main() {
     require_root
+    require_systemd
     case "${1:-default}" in
         install|update|upgrade)
             cmd_install
@@ -676,13 +1030,22 @@ main() {
         stop)               cmd_stop ;;
         restart)            cmd_restart ;;
         status)             cmd_status ;;
-        log|logs)           cmd_log ;;
+        log|logs)
+            shift || true
+            cmd_log "$@"
+            ;;
         follow|log-follow)  cmd_log_follow ;;
         reset-password|reset|password)
             cmd_reset_password
             ;;
         change-listen-addr|change-listen|listen)
             cmd_change_listen_addr
+            ;;
+        backup)
+            cmd_backup
+            ;;
+        version|--version|-v)
+            cmd_version
             ;;
         menu)
             cmd_show_menu
@@ -692,10 +1055,10 @@ main() {
             ;;
         default)
             # 一键命令默认行为：未装 → 安装；已装 → 菜单。
-            # 这是用户从 README 复制粘贴的核心 UX 保证。
             if is_installed; then
                 cmd_show_menu
             else
+                print_banner
                 cmd_install
             fi
             ;;

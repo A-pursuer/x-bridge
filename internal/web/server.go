@@ -134,7 +134,7 @@ func New(
 	}
 	return &Server{
 		listenAddr:   cfg.Web.ListenAddr,
-		log:          log.With("component", "web"),
+		log:          log.With("module", "web"),
 		store:        st,
 		supervisor:   sup,
 		authSvc:      authSvc,
@@ -168,33 +168,50 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("监听 %s 失败：%w", s.listenAddr, err)
 	}
-	s.log.Info("Web 面板已启动", "listen", s.listenAddr)
+	s.log.Info("Web 面板已启动",
+		"event", "web_listening",
+		"listen", s.listenAddr,
+	)
 
 	// ListenAndServe 阻塞；用单独 goroutine 跑，主流程等 ctx 取消信号。
+	//
+	// 设计动机（v0.8.4 修复）：旧实现 Serve 返回 ErrServerClosed 时 close
+	// 整个 errCh，外层 select 还在等 ctx.Done 时若 ctx 还未触发就会命中
+	// `case err := <-errCh:` 拿到 nil error，然后 `fmt.Errorf("HTTP Serve: %w", nil)`
+	// 把 nil 包进错误链——errors.Unwrap 拿到 nil 让上层判定无所适从。
+	// 新实现：errCh 始终 send 一次（含 nil 表示"Serve 正常退出"），select
+	// 显式区分 nil / 非 nil 两种 case。
 	errCh := make(chan error, 1)
 	go func() {
-		// http.Server.Serve 在 Shutdown 调用后会返回 http.ErrServerClosed，
-		// 这是正常退出，不向上抛错。
-		if err := s.httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
+		serveErr := s.httpServer.Serve(listener)
+		// ErrServerClosed 是 Shutdown 触发的"预期退出"；其它错误视为异常。
+		if errors.Is(serveErr, http.ErrServerClosed) {
+			errCh <- nil
 			return
 		}
-		close(errCh)
+		errCh <- serveErr
 	}()
 
 	select {
 	case <-ctx.Done():
-		s.log.Info("收到退出信号，开始优雅关闭 Web 面板")
+		s.log.Info("收到退出信号，开始优雅关闭 Web 面板",
+			"event", "web_shutdown_begin",
+		)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
 			s.log.Warn("Web 面板优雅关闭超时（非致命）", "err", err)
 		}
-		// 等 Serve goroutine 真正退出（防止泄漏）。
+		// 等 Serve goroutine 真正退出（防止泄漏）。Shutdown 会让 Serve 返回
+		// ErrServerClosed → goroutine 写 nil；这里读取后 select 收尾。
 		<-errCh
 		return nil
 	case err := <-errCh:
-		// Serve 期间出错：通常是端口被占用或被 OS 拔了；向上传让 main 决定。
+		// Serve 在 ctx.Done 之前自行退出：err==nil 是边角"被外部 listener.Close"，
+		// err!=nil 才是真异常（如端口被强制关闭）。
+		if err == nil {
+			return nil
+		}
 		return fmt.Errorf("HTTP Serve：%w", err)
 	}
 }
@@ -293,6 +310,14 @@ func (s *Server) reloadFromStore(ctx context.Context) error {
 	newCfg, err := config.LoadFromStore(ctx, s.store, s.dbPath)
 	if err != nil {
 		return fmt.Errorf("从 store 加载新配置：%w", err)
+	}
+	// 与 main.go 启动期一致：运行时若新写入的 settings 包含脏值（理论上
+	// 应当被 handlePatchSettings 拦下，但 v0.8.4 之前已落库的脏数据 +
+	// 未来直连 sqlite3 手工写入仍可能触发），通过 WARN 让运维可见。
+	if len(newCfg.DirtyKeys) > 0 {
+		s.log.Warn("Reload 时发现 settings 表存在脏数据（已退化为默认值）",
+			"dirty_keys", newCfg.DirtyKeys,
+		)
 	}
 	rctx, cancel := s.reloadCtx(ctx)
 	defer cancel()

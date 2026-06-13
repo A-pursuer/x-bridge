@@ -26,7 +26,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strconv"
 	stdsync "sync"
 	"time"
@@ -115,14 +117,14 @@ func New(cfg *config.Root, log *slog.Logger, xboardC *xboard.Client, xuiC *xui.C
 			xboardC:   xboardC,
 			xuiC:      xuiC,
 			store:     st,
-			log:       log.With("bridge", b.Name, "protocol", b.Protocol),
+			log:       log.With("module", "sync", "bridge", b.Name, "protocol", b.Protocol),
 		}
 		workers = append(workers, w)
 	}
 	if len(workers) == 0 {
 		log.Warn("没有任何启用的 Bridge，引擎将立即返回")
 	}
-	return &Engine{bridges: workers, log: log}, nil
+	return &Engine{bridges: workers, log: log.With("module", "sync")}, nil
 }
 
 // Run 阻塞执行引擎；ctx 取消后等所有 worker 优雅返回再退出。
@@ -221,8 +223,16 @@ func (w *bridgeWorker) tickerLoop(ctx context.Context, name string, interval tim
 
 // runStep 执行单次同步并把耗时 / 错误规范化打印。
 //
-// 不向上抛 error：上游不需要据此做决策；保留 panic 防御也不必要——standard
-// http / sql 客户端在合规调用下不会 panic。
+// 不向上抛 error：上游不需要据此做决策。
+//
+// Panic 防护（v0.8.4 起）：默认假设 fn 不 panic——standard http / sql / json
+// 客户端在合规调用下不会 panic；但 xui.Client.fetchInbounds 等深路径在极端
+// 边角下（nil pointer / json 解码异常）理论可能 panic。若不 recover，单条
+// sync goroutine panic 会触发 Go runtime fatal error 让整个进程崩溃——这
+// 与"长期运行 daemon"目标相违（虽然 systemd 会重启，但仍会丢一次同步
+// 周期 + 重启期间所有 worker 都中断）。本函数捕获 panic 后按"同步失败"
+// 路径走 WARN 日志 + ERROR 含 stack，让下个周期照常发起；与其它业务错误
+// 处理保持一致。
 //
 // trace_id 注入（v0.5.3 起）：每次进入 runStep 都生成一个新的短 trace_id,
 // 通过 ctx 携带的 trace 化 logger 让本次 tick 的所有主入口日志（runStep
@@ -235,15 +245,42 @@ func (w *bridgeWorker) runStep(ctx context.Context, name string, fn func(context
 	ctx = contextWithLogger(ctx, log)
 
 	start := time.Now()
-	err := fn(ctx)
+	var err error
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				// 把 panic 转成 error；warn 路径会照常打印。同时单独再
+				// 输出 ERROR 含 stack 供运维排查（panic 是真异常，需要
+				// 比普通 sync 错误更高的告警级别）。
+				log.Error("同步 panic 已被捕获，本周期跳过",
+					"event", "sync_panic",
+					"panic", rec,
+					"stack", string(debug.Stack()),
+				)
+				err = fmt.Errorf("panic: %v", rec)
+			}
+		}()
+		err = fn(ctx)
+	}()
 	elapsed := time.Since(start)
+	elapsedMs := elapsed.Milliseconds()
 	switch {
 	case err == nil:
-		log.Debug("同步完成", "elapsed", elapsed)
+		log.Debug("同步完成",
+			"event", "sync_done",
+			"elapsed_ms", elapsedMs,
+		)
 	case ctx.Err() != nil:
 		// 退出过程中触发的失败属于正常现象，按 info 级别记录即可。
-		log.Info("同步因退出而中断", "elapsed", elapsed)
+		log.Info("同步因退出而中断",
+			"event", "sync_interrupted",
+			"elapsed_ms", elapsedMs,
+		)
 	default:
-		log.Warn("同步失败", "elapsed", elapsed, "err", err)
+		log.Warn("同步失败",
+			"event", "sync_failed",
+			"elapsed_ms", elapsedMs,
+			"err", err,
+		)
 	}
 }

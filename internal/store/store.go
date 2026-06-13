@@ -226,8 +226,28 @@ type Store interface {
 	// UpdatedAt 自动刷新，CreatedAt 不变。
 	UpdateBridge(ctx context.Context, b BridgeRow) error
 
-	// DeleteBridge 按 name 删除；幂等，不存在不视为错误。
+	// DeleteBridge 按 name 删除 bridges 行；幂等，不存在不视为错误。
+	//
+	// 注意：本方法**不清理** traffic_baseline 关联行——清理必须在 supervisor
+	// 完成 Reload（旧 sync worker 已停止）之后由调用方显式调用
+	// DeleteBaselinesByBridge。这是因为旧 worker 在 reload 完成前的极小窗口
+	// 内仍可能通过 EnsureBaseline / RecordSeen / ApplyReportSuccess 把刚清
+	// 掉的 baseline 重新写回，事务内一并清不掉这个并发窗口（事务在 store
+	// 层提交后立刻可见，但 reload 在 store 层之外，不参与同一事务）。
+	//
+	// 正确的删除流程（详见 web.handleDeleteBridge）：
+	//   1) DeleteBridge(ctx, name) → 仅删 bridges 行；
+	//   2) reloadFromStore        → 旧 sync worker 退出，新 engine 不含该 bridge；
+	//   3) DeleteBaselinesByBridge → 此时绝无 worker 再访问 baseline，安全清理。
 	DeleteBridge(ctx context.Context, name string) error
+
+	// DeleteBaselinesByBridge 删除 traffic_baseline 表中以指定 bridge_name 为
+	// 主键的所有行；幂等。返回被删除的行数供日志观测。
+	//
+	// 调用约束：仅在确保该 bridge 已不再被任何 sync worker 访问后才能调用
+	// （即 reload 已让旧 worker 退出）。详见 DeleteBridge 注释中"正确的
+	// 删除流程"。
+	DeleteBaselinesByBridge(ctx context.Context, bridgeName string) (int64, error)
 
 	// ============ admin_users ============
 
@@ -940,12 +960,27 @@ WHERE name = ?;
 }
 
 // DeleteBridge 实现 Store 接口；幂等。
+//
+// 仅删 bridges 行；traffic_baseline 清理由 DeleteBaselinesByBridge 完成。
+// 详见接口注释中"正确的删除流程"。
 func (s *sqliteStore) DeleteBridge(ctx context.Context, name string) error {
-	const stmt = `DELETE FROM bridges WHERE name = ?;`
-	if _, err := s.db.ExecContext(ctx, stmt, name); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM bridges WHERE name = ?;`, name); err != nil {
 		return fmt.Errorf("DeleteBridge %q：%w", name, err)
 	}
 	return nil
+}
+
+// DeleteBaselinesByBridge 实现 Store 接口；幂等。
+func (s *sqliteStore) DeleteBaselinesByBridge(ctx context.Context, bridgeName string) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM traffic_baseline WHERE bridge_name = ?;`, bridgeName)
+	if err != nil {
+		return 0, fmt.Errorf("DeleteBaselinesByBridge %q：%w", bridgeName, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("DeleteBaselinesByBridge %q 取受影响行数：%w", bridgeName, err)
+	}
+	return n, nil
 }
 
 // ============================================================================

@@ -175,6 +175,13 @@ type Root struct {
 	Intervals Intervals
 	Reporting Reporting
 	Web       Web
+
+	// DirtyKeys 列出 LoadFromStore 时解析失败 / 已退化为默认值的 settings
+	// 键。仅供启动期 WARN 日志披露；运行时业务逻辑不读取本字段。
+	//
+	// 触发条件：settings 表中某 key 存在且非空，但 strconv.Atoi /
+	// strconv.ParseBool 无法解析（例如运维手工写入了非法值）。
+	DirtyKeys []string `json:"-"`
 }
 
 // Log 描述日志输出策略。
@@ -332,20 +339,21 @@ func LoadFromStore(ctx context.Context, st store.Store, dbPath string) (*Root, e
 		return nil, fmt.Errorf("加载 bridges：%w", err)
 	}
 
+	dirty := make([]string, 0, 4)
 	root := &Root{
 		Log: Log{
 			Level:      settings[SettingLogLevel],
 			File:       settings[SettingLogFile],
-			MaxSizeMB:  parseSettingInt(settings, SettingLogMaxSizeMB, 0),
-			MaxBackups: parseSettingInt(settings, SettingLogMaxBackups, 0),
-			MaxAgeDays: parseSettingInt(settings, SettingLogMaxAgeDays, 0),
+			MaxSizeMB:  parseSettingInt(settings, SettingLogMaxSizeMB, 0, &dirty),
+			MaxBackups: parseSettingInt(settings, SettingLogMaxBackups, 0, &dirty),
+			MaxAgeDays: parseSettingInt(settings, SettingLogMaxAgeDays, 0, &dirty),
 		},
 		State: State{Database: dbPath},
 		Xboard: Xboard{
 			APIHost:       settings[SettingXboardAPIHost],
 			Token:         settings[SettingXboardToken],
-			TimeoutSec:    parseSettingInt(settings, SettingXboardTimeoutSec, 0),
-			SkipTLSVerify: parseSettingBool(settings, SettingXboardSkipTLSVerify, false),
+			TimeoutSec:    parseSettingInt(settings, SettingXboardTimeoutSec, 0, &dirty),
+			SkipTLSVerify: parseSettingBool(settings, SettingXboardSkipTLSVerify, false, &dirty),
 			UserAgent:     settings[SettingXboardUserAgent],
 		},
 		Xui: Xui{
@@ -355,24 +363,25 @@ func LoadFromStore(ctx context.Context, st store.Store, dbPath string) (*Root, e
 			APIHost:       settings[SettingXuiAPIHost],
 			BasePath:      settings[SettingXuiBasePath],
 			APIToken:      settings[SettingXuiAPIToken],
-			TimeoutSec:    parseSettingInt(settings, SettingXuiTimeoutSec, 0),
-			SkipTLSVerify: parseSettingBool(settings, SettingXuiSkipTLSVerify, false),
+			TimeoutSec:    parseSettingInt(settings, SettingXuiTimeoutSec, 0, &dirty),
+			SkipTLSVerify: parseSettingBool(settings, SettingXuiSkipTLSVerify, false, &dirty),
 		},
 		Intervals: Intervals{
-			UserPullSec:    parseSettingInt(settings, SettingIntervalsUserPullSec, 0),
-			TrafficPushSec: parseSettingInt(settings, SettingIntervalsTrafficPushSec, 0),
-			AlivePushSec:   parseSettingInt(settings, SettingIntervalsAlivePushSec, 0),
-			StatusPushSec:  parseSettingInt(settings, SettingIntervalsStatusPushSec, 0),
+			UserPullSec:    parseSettingInt(settings, SettingIntervalsUserPullSec, 0, &dirty),
+			TrafficPushSec: parseSettingInt(settings, SettingIntervalsTrafficPushSec, 0, &dirty),
+			AlivePushSec:   parseSettingInt(settings, SettingIntervalsAlivePushSec, 0, &dirty),
+			StatusPushSec:  parseSettingInt(settings, SettingIntervalsStatusPushSec, 0, &dirty),
 		},
 		Reporting: Reporting{
-			AliveEnabled:  parseSettingBool(settings, SettingReportingAliveEnabled, false),
-			StatusEnabled: parseSettingBool(settings, SettingReportingStatusEnabled, false),
+			AliveEnabled:  parseSettingBool(settings, SettingReportingAliveEnabled, false, &dirty),
+			StatusEnabled: parseSettingBool(settings, SettingReportingStatusEnabled, false, &dirty),
 		},
 		Web: Web{
 			ListenAddr:               settings[SettingWebListenAddr],
-			SessionMaxAgeHours:       parseSettingInt(settings, SettingWebSessionMaxAgeHours, 0),
-			AbsoluteMaxLifetimeHours: parseSettingInt(settings, SettingWebAbsoluteMaxLifetimeHours, 0),
+			SessionMaxAgeHours:       parseSettingInt(settings, SettingWebSessionMaxAgeHours, 0, &dirty),
+			AbsoluteMaxLifetimeHours: parseSettingInt(settings, SettingWebAbsoluteMaxLifetimeHours, 0, &dirty),
 		},
+		DirtyKeys: dirty,
 	}
 
 	// bridges 行表 → []Bridge：纯字段转换。Validate 后续会再做规范化（lower / trim 等）。
@@ -682,7 +691,11 @@ func sortedKeys(m map[string]struct{}) []string {
 // 缺失或解析失败一律返回 fallback——v0.2 的"半填友好"原则：从持久层
 // 读到的脏数据不应导致进程崩溃，而是退化到默认值并由 Web 表单层在用户
 // 下次写入时立即提示。
-func parseSettingInt(m map[string]string, key string, fallback int) int {
+//
+// 脏数据可观测性（v0.8.4 起）：若 key 存在且非空但解析失败，会被 LoadFromStore
+// 通过 dirtyKeys 切片收集并以 WARN 形态输出；避免运维误以为"我已经填好了
+// 配置"实际却走默认值。下次 Web 表单写回会自动覆盖脏数据。
+func parseSettingInt(m map[string]string, key string, fallback int, dirtyKeys *[]string) int {
 	raw, ok := m[key]
 	if !ok {
 		return fallback
@@ -693,6 +706,9 @@ func parseSettingInt(m map[string]string, key string, fallback int) int {
 	}
 	n, err := strconv.Atoi(raw)
 	if err != nil {
+		if dirtyKeys != nil {
+			*dirtyKeys = append(*dirtyKeys, fmt.Sprintf("%s=%q (int)", key, raw))
+		}
 		return fallback
 	}
 	return n
@@ -703,7 +719,7 @@ func parseSettingInt(m map[string]string, key string, fallback int) int {
 //
 // strconv.ParseBool 能处理 "1"/"0"/"true"/"false"/"True" 等十种常见写法，
 // 不需要在这里做大小写归一。
-func parseSettingBool(m map[string]string, key string, fallback bool) bool {
+func parseSettingBool(m map[string]string, key string, fallback bool, dirtyKeys *[]string) bool {
 	raw, ok := m[key]
 	if !ok {
 		return fallback
@@ -714,6 +730,9 @@ func parseSettingBool(m map[string]string, key string, fallback bool) bool {
 	}
 	b, err := strconv.ParseBool(raw)
 	if err != nil {
+		if dirtyKeys != nil {
+			*dirtyKeys = append(*dirtyKeys, fmt.Sprintf("%s=%q (bool)", key, raw))
+		}
 		return fallback
 	}
 	return b

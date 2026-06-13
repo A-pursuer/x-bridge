@@ -182,19 +182,33 @@ func runDaemon(args []string) {
 		cfg.Web.ListenAddr = envAddr
 	}
 
-	log, closeLog, err := logger.New(cfg.Log)
+	log, closeLog, err := logger.New(cfg.Log, &logger.BaseAttrs{Version: version})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[fatal] 初始化日志失败: %v\n", err)
 		os.Exit(2)
 	}
 	defer closeLog()
 
+	// 持久层脏数据告警（v0.8.4 起）：settings 表里某 key 存在且非空但
+	// 解析失败时，对应字段已退化为默认值；运维若不察觉会以为"我已经填
+	// 好了配置"，实际却走默认。一次性 WARN 暴露所有脏键，便于运维通过
+	// Web 表单覆盖。
+	if len(cfg.DirtyKeys) > 0 {
+		log.Warn("settings 表存在解析失败的脏数据，已退化为默认值",
+			"event", "settings_dirty_keys",
+			"dirty_keys", cfg.DirtyKeys,
+			"hint", "请在 Web 面板重新写入对应字段以覆盖脏数据",
+		)
+	}
+
 	// "首次启动半填" 友好提示：仅打 WARN，让运维一眼看到关键字段为空。
 	// 凭据不全 + 有 enabled bridge 时的硬护栏在 supervisor.applyCredsGuard 实现。
 	if cfg.Xboard.APIHost == "" || cfg.Xboard.Token == "" {
-		log.Warn("Xboard 凭据未配置，请登录 Web 面板补齐后重启进程",
+		log.Warn("Xboard 凭据未配置",
+			"event", "xboard_creds_missing",
 			"api_host_set", cfg.Xboard.APIHost != "",
 			"token_set", cfg.Xboard.Token != "",
+			"hint", "登录 Web 面板补齐后重启进程",
 		)
 	}
 	// v0.6 起 xui 仅 Bearer API Token 单通道：必须 api_host + api_token 都
@@ -202,9 +216,11 @@ func runDaemon(args []string) {
 	// status_handler 共享同一份判定（不在此处手写 OR 表达式重蹈
 	// "凭据完整性灯不一致" 覆辙）。
 	if !cfg.Xui.CredsComplete() {
-		log.Warn("3x-ui 凭据未配置，请登录 Web 面板补齐后重启进程",
+		log.Warn("3x-ui 凭据未配置",
+			"event", "xui_creds_missing",
 			"api_host_set", cfg.Xui.APIHost != "",
 			"api_token_set", cfg.Xui.APIToken != "",
+			"hint", "登录 Web 面板补齐后重启进程",
 		)
 	}
 
@@ -241,7 +257,7 @@ func runDaemon(args []string) {
 	}
 
 	log.Info("xboard-xui-bridge 启动",
-		"version", version,
+		"event", "process_starting",
 		"db", *dbPath,
 		"bridges", len(cfg.Bridges),
 		"web", cfg.Web.ListenAddr,
@@ -274,7 +290,9 @@ func runDaemon(args []string) {
 		os.Exit(1)
 	}
 
-	log.Info("xboard-xui-bridge 已退出")
+	log.Info("xboard-xui-bridge 已退出",
+		"event", "process_stopped",
+	)
 }
 
 // runResetPassword 处理 `reset-password` 子命令。
