@@ -47,6 +47,7 @@ import (
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/config"
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/store"
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/supervisor"
+	"github.com/xboard-bridge/xboard-xui-bridge/internal/syncstatus"
 )
 
 // 常量集中定义。Cookie 名 / 路径 / 关闭超时一类的字面量都在这里——
@@ -88,6 +89,7 @@ type Server struct {
 	store      store.Store
 	supervisor *supervisor.Supervisor
 	authSvc    *auth.Service
+	syncReg    *syncstatus.Registry
 	dbPath     string
 
 	httpServer *http.Server
@@ -110,6 +112,7 @@ func New(
 	st store.Store,
 	sup *supervisor.Supervisor,
 	authSvc *auth.Service,
+	syncReg *syncstatus.Registry,
 ) (*Server, error) {
 	if cfg == nil {
 		return nil, errors.New("web.New: cfg 不可为 nil")
@@ -126,6 +129,9 @@ func New(
 	if authSvc == nil {
 		return nil, errors.New("web.New: authSvc 不可为 nil")
 	}
+	if syncReg == nil {
+		return nil, errors.New("web.New: syncReg 不可为 nil")
+	}
 	if cfg.Web.ListenAddr == "" {
 		return nil, errors.New("web.New: cfg.Web.ListenAddr 不可为空")
 	}
@@ -138,6 +144,7 @@ func New(
 		store:        st,
 		supervisor:   sup,
 		authSvc:      authSvc,
+		syncReg:      syncReg,
 		dbPath:       cfg.State.Database,
 		loginLimiter: newLoginRateLimiter(),
 	}, nil
@@ -280,9 +287,14 @@ func (s *Server) buildMux() *http.ServeMux {
 	mux.HandleFunc("POST /api/xui-panels", writeChain(s.handleCreatePanel))
 	mux.HandleFunc("PUT /api/xui-panels/{name}", writeChain(s.handleUpdatePanel))
 	mux.HandleFunc("DELETE /api/xui-panels/{name}", writeChain(s.handleDeletePanel))
+	// 测试连接：探测表单当前参数的连通性，不落库（走 writeChain 因含 CSRF 写语义）。
+	mux.HandleFunc("POST /api/xui-panels/test", writeChain(s.handleTestPanel))
 
 	// 6. 引擎状态。
 	mux.HandleFunc("GET /api/status", authChain(s.handleGetStatus))
+
+	// 6.5 桥接级同步状态（fork 可观测性扩展）。
+	mux.HandleFunc("GET /api/sync-status", authChain(s.handleGetSyncStatus))
 
 	// 7. SPA fallback：捕获所有未命中 /api/ 的 GET 请求。
 	mux.Handle("/", commonChain(s.spaHandler()))

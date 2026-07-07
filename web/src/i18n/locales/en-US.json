@@ -161,7 +161,10 @@
     "fieldPanel": "3x-ui Panel",
     "panelPlaceholder": "Select a panel",
     "errPanelEmpty": "Select a 3x-ui panel (create one on the Panels page first if the list is empty)",
-    "tablePanel": "Panel"
+    "tablePanel": "Panel",
+    "syncOk": "In sync",
+    "syncFail": "Sync failed",
+    "syncPending": "Awaiting sync"
   },
   "settings": {
     "title": "Settings",
@@ -282,6 +285,8 @@
     "okUpdated": "Panel saved",
     "okDeleted": "Panel {name} deleted",
     "emptyTitle": "No 3x-ui panels yet",
-    "emptyHint": "Add a 3x-ui panel first, then create bridges for it on the Bridges page"
+    "emptyHint": "Add a 3x-ui panel first, then create bridges for it on the Bridges page",
+    "testBtn": "Test connection",
+    "testing": "Testing…"
   }
 }

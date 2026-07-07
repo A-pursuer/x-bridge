@@ -1,13 +1,23 @@
 package web
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/xboard-bridge/xboard-xui-bridge/internal/config"
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/store"
+	"github.com/xboard-bridge/xboard-xui-bridge/internal/xui"
 )
+
+// panelTestTimeout 是「测试连接」探测的总超时。
+//
+// 选 8s：正常 localhost / Tailscale 内网面板 API 响应在百毫秒级；给到 8s
+// 是为了让"地址写错打到公网服务、TCP 卡在 SYN 重传"这类场景也能在运维
+// 可接受的等待内返回失败，而不是一直转圈。
+const panelTestTimeout = 8 * time.Second
 
 // panels_handler.go 实现 /api/xui-panels 的 CRUD（fork 多面板扩展）。
 //
@@ -229,6 +239,102 @@ func (s *Server) handleDeletePanel(w http.ResponseWriter, r *http.Request) {
 		"name", name,
 	)
 	s.writeJSON(w, http.StatusOK, struct{}{})
+}
+
+// panelTestResponse 是 POST /api/xui-panels/test 的返回结构。
+//
+// OK=true 表示探测请求拿到了合法 3x-ui API 响应（连通 + 鉴权通过）；
+// OK=false 时 Message 是面向运维的中文诊断。始终返回 200——"测试失败"
+// 是正常业务结果而非 HTTP 错误，让前端统一按 data 路径解析。
+type panelTestResponse struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message"`
+}
+
+// handleTestPanel 处理 POST /api/xui-panels/test（fork 可观测性扩展）。
+//
+// 用运维当前填在表单里的参数（可能尚未保存）构造一个临时 xui.Client，
+// 调最轻的鉴权探测 GET /panel/api/server/status。全程不落库、不改动任何
+// 现有面板——纯只读探测，让运维在保存前就能验证地址/端口/路径/令牌是否正确。
+//
+// 参数校验失败（如 api_host 漏 scheme）→ 400；探测本身失败（连不上 /
+// 鉴权不过）→ 200 + {ok:false, message}，因为"测出配置有问题"正是本
+// 端点的预期产出，不是服务端错误。
+func (s *Server) handleTestPanel(w http.ResponseWriter, r *http.Request) {
+	var req panelRequest
+	if err := readJSON(r, &req); err != nil {
+		s.writeError(w, http.StatusBadRequest, errCodeBadRequest, "请求体格式错误")
+		return
+	}
+	probeCfg, err := config.NormalizeXuiProbe(config.Xui{
+		APIHost:       req.APIHost,
+		BasePath:      req.BasePath,
+		APIToken:      req.APIToken,
+		TimeoutSec:    req.TimeoutSec,
+		SkipTLSVerify: req.SkipTLSVerify,
+	})
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, errCodeBadRequest, "参数不合法："+err.Error())
+		return
+	}
+
+	client, err := xui.New(probeCfg, s.log)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, errCodeBadRequest, "构造探测客户端失败："+err.Error())
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), panelTestTimeout)
+	defer cancel()
+	if _, err := client.GetServerStatus(ctx); err != nil {
+		s.writeJSON(w, http.StatusOK, panelTestResponse{
+			OK:      false,
+			Message: describePanelProbeErr(err),
+		})
+		return
+	}
+	s.writeJSON(w, http.StatusOK, panelTestResponse{
+		OK:      true,
+		Message: "连接成功，鉴权通过",
+	})
+}
+
+// describePanelProbeErr 把探测错误映射成面向运维的中文诊断。
+//
+// 三类来源（对应 xui.Error 的三种形态）：
+//   - HTTPStatus=0：传输层失败（连不上 / 超时 / TLS）→ 检查地址端口；
+//   - HTTPStatus=200 但响应非 JSON / 401 / 404：几乎总是"打到了非 API
+//     服务"或"令牌不对"——即运维今天踩的漏端口/错路径场景；
+//   - 其它 HTTP 码：原样提示状态码。
+func describePanelProbeErr(err error) string {
+	var xe *xui.Error
+	if !errors.As(err, &xe) {
+		return "探测失败：" + err.Error()
+	}
+	switch {
+	case xe.HTTPStatus == 0:
+		return "无法连接到面板，请检查地址与端口是否正确、内网是否可达"
+	case xe.HTTPStatus == 401 || xe.HTTPStatus == 403:
+		return "鉴权失败：API 令牌不正确，请在 3x-ui 面板重新生成后填入"
+	case xe.HTTPStatus == 404 || strings.Contains(xe.Msg, "非 JSON"):
+		return "收到非 API 响应（鉴权失败或面板路径/端口错误）——常见于漏写端口、面板路径前缀填错或令牌无效"
+	default:
+		return "探测失败（HTTP " + statusText(xe.HTTPStatus) + "）：" + xe.Msg
+	}
+}
+
+// statusText 把状态码转字符串（避免引入 strconv 到本文件仅为一处使用）。
+func statusText(code int) string {
+	if code <= 0 {
+		return "network"
+	}
+	const digits = "0123456789"
+	out := []byte{}
+	for code > 0 {
+		out = append([]byte{digits[code%10]}, out...)
+		code /= 10
+	}
+	return string(out)
 }
 
 // panelFromRequest 把请求 DTO 转换为 store.XuiPanelRow。

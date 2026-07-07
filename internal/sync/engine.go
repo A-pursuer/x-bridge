@@ -36,6 +36,7 @@ import (
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/config"
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/protocol"
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/store"
+	"github.com/xboard-bridge/xboard-xui-bridge/internal/syncstatus"
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/xboard"
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/xui"
 )
@@ -101,7 +102,7 @@ type Engine struct {
 // 失败原因：协议适配器构造失败（出现配置中未实现的协议名），或 bridge
 // 引用的面板没有对应客户端（supervisor 构造遗漏，属编程错误）。这种错误
 // 属于启动期错误，应当让进程退出。
-func New(cfg *config.Root, log *slog.Logger, xboardC *xboard.Client, xuiClients map[string]*xui.Client, st store.Store) (*Engine, error) {
+func New(cfg *config.Root, log *slog.Logger, xboardC *xboard.Client, xuiClients map[string]*xui.Client, st store.Store, reg *syncstatus.Registry) (*Engine, error) {
 	workers := make([]*bridgeWorker, 0, len(cfg.Bridges))
 	for i := range cfg.Bridges {
 		b := cfg.Bridges[i]
@@ -125,6 +126,7 @@ func New(cfg *config.Root, log *slog.Logger, xboardC *xboard.Client, xuiClients 
 			xboardC:   xboardC,
 			xuiC:      xuiC,
 			store:     st,
+			reg:       reg,
 			log:       log.With("module", "sync", "bridge", b.Name, "panel", b.XuiPanel, "protocol", b.Protocol),
 		}
 		workers = append(workers, w)
@@ -167,6 +169,9 @@ type bridgeWorker struct {
 	xboardC *xboard.Client
 	xuiC    *xui.Client
 	store   store.Store
+	// reg 记录本 worker 每条循环的最近同步结果供 Web 面板展示；
+	// 可能为 nil（如未来某些精简装配路径），Record 前需判空。
+	reg *syncstatus.Registry
 
 	log *slog.Logger
 }
@@ -278,8 +283,11 @@ func (w *bridgeWorker) runStep(ctx context.Context, name string, fn func(context
 			"event", "sync_done",
 			"elapsed_ms", elapsedMs,
 		)
+		w.recordStatus(name, true, "", elapsed)
 	case ctx.Err() != nil:
 		// 退出过程中触发的失败属于正常现象，按 info 级别记录即可。
+		// 不写入注册表：进程退出中的中断不是"同步失败"，避免面板在
+		// 关机瞬间闪红。
 		log.Info("同步因退出而中断",
 			"event", "sync_interrupted",
 			"elapsed_ms", elapsedMs,
@@ -290,5 +298,14 @@ func (w *bridgeWorker) runStep(ctx context.Context, name string, fn func(context
 			"elapsed_ms", elapsedMs,
 			"err", err,
 		)
+		w.recordStatus(name, false, err.Error(), elapsed)
 	}
+}
+
+// recordStatus 把本次同步结果写入注册表供 Web 面板展示；reg 为 nil 时 no-op。
+func (w *bridgeWorker) recordStatus(loop string, ok bool, errMsg string, elapsed time.Duration) {
+	if w.reg == nil {
+		return
+	}
+	w.reg.Record(w.cfg.Name, loop, ok, errMsg, elapsed)
 }

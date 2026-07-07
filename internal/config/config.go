@@ -644,6 +644,39 @@ func (x Xboard) CredsComplete() bool {
 	return x.APIHost != "" && x.Token != ""
 }
 
+// NormalizeXuiProbe 校验并规范化一份"待探测"的 3x-ui 面板参数。
+//
+// 用途：Web 层「测试连接」端点在不落库的前提下，用运维当前填在表单里的
+// 参数构造一个临时 xui.Client 去探测连通性。它需要与 LoadFromStore →
+// Validate 完全一致的规范化规则（trim scheme、去尾斜杠、归一化 base_path、
+// token 字符集轻校验），否则"测试通过但保存后行为不同"会误导运维。
+//
+// 抽出本导出函数而非让 Web 层重写一遍：保持 config 包为规范化规则的单一
+// 真相源。校验失败返回错误（供 Web 层转成 400）；成功返回规范化后的副本。
+func NormalizeXuiProbe(in Xui) (Xui, error) {
+	out := in
+	out.APIHost = strings.TrimSpace(out.APIHost)
+	if out.APIHost == "" {
+		return Xui{}, errors.New("api_host 不可为空")
+	}
+	if err := validateHTTPHost("api_host", out.APIHost); err != nil {
+		return Xui{}, err
+	}
+	out.APIHost = strings.TrimRight(out.APIHost, "/")
+	out.BasePath = normalizeBasePath(out.BasePath)
+	out.APIToken = strings.TrimSpace(out.APIToken)
+	if out.APIToken == "" {
+		return Xui{}, errors.New("api_token 不可为空")
+	}
+	if err := validateAPITokenShape("api_token", out.APIToken); err != nil {
+		return Xui{}, err
+	}
+	if out.TimeoutSec <= 0 {
+		out.TimeoutSec = defaultXuiTimeoutSec
+	}
+	return out, nil
+}
+
 // FindXuiPanel 按名字查找面板；第二返回值表示是否存在。
 //
 // 供 supervisor（构造客户端 / 凭据护栏）与 web/status_handler（面板凭据灯）

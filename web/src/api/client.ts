@@ -159,6 +159,27 @@ export interface Status {
   now: string
 }
 
+// PanelTestResult（fork 可观测性扩展）：面板「测试连接」返回。
+// ok=false 时 message 是中文诊断；ok 与失败都以 HTTP 200 返回，故走 data 路径。
+export interface PanelTestResult {
+  ok: boolean
+  message: string
+}
+
+// LoopStatus / SyncStatus（fork 可观测性扩展）：桥接各同步循环的最近结果。
+export interface LoopStatus {
+  loop: string
+  ok: boolean
+  err_msg?: string
+  elapsed_ms: number
+  at: string
+}
+
+export interface SyncStatus {
+  // key = 桥接名；无同步记录的桥接不出现。
+  bridges: Record<string, LoopStatus[]>
+}
+
 export const api = {
   // ---- auth ----
   // login / me 走 skipAuthHandler：自身就是用来判定登录态，不能被
@@ -218,9 +239,17 @@ export const api = {
   deletePanel(name: string) {
     return request<void>(`/api/xui-panels/${encodeURIComponent(name)}`, { method: 'DELETE' })
   },
+  // 测试连接：用表单当前值探测，不落库。
+  testPanel(p: Omit<XuiPanel, 'bridge_count' | 'created_at' | 'updated_at'>) {
+    return request<PanelTestResult>('/api/xui-panels/test', { method: 'POST', body: p })
+  },
 
   // ---- status ----
   getStatus() {
     return request<Status>('/api/status')
+  },
+  // ---- sync status（桥接级同步结果）----
+  getSyncStatus() {
+    return request<SyncStatus>('/api/sync-status')
   },
 }

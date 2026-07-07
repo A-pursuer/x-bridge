@@ -55,7 +55,7 @@ import { Switch } from '@/components/ui/switch'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import LiveDot from '@/components/LiveDot.vue'
 import { useToast } from '@/composables/useToast'
-import { api, type Bridge, type XuiPanel } from '@/api/client'
+import { api, type Bridge, type XuiPanel, type LoopStatus } from '@/api/client'
 
 const { t } = useI18n()
 const { toast } = useToast()
@@ -66,7 +66,29 @@ const AUTO_SENTINEL = '__auto__'
 const bridges = ref<Bridge[]>([])
 // panels 供表单"所属面板"下拉使用（fork 多面板扩展）。
 const panels = ref<XuiPanel[]>([])
+// syncStatus：桥接名 → 各同步循环最近结果（fork 可观测性扩展）。
+const syncStatus = ref<Record<string, LoopStatus[]>>({})
 const loading = ref(true)
+
+// bridgeSyncState 把某桥接的多条 loop 结果聚合成一个卡片灯状态：
+//   - 无记录        → 'pending'（等待首次同步）
+//   - 全部 ok       → 'ok'
+//   - 任一失败      → 'fail'
+function bridgeSyncState(name: string): 'ok' | 'fail' | 'pending' {
+  const loops = syncStatus.value[name]
+  if (!loops || loops.length === 0) return 'pending'
+  return loops.every((l) => l.ok) ? 'ok' : 'fail'
+}
+
+// bridgeSyncFailMsg 拼出失败 loop 的简短提示（tooltip 用）。
+function bridgeSyncFailMsg(name: string): string {
+  const loops = syncStatus.value[name]
+  if (!loops) return ''
+  return loops
+    .filter((l) => !l.ok)
+    .map((l) => `${l.loop}: ${l.err_msg ?? ''}`)
+    .join('\n')
+}
 
 // 抽屉表单状态
 const drawerOpen = ref(false)
@@ -105,8 +127,13 @@ const selectXboardType = computed({
 async function refresh(): Promise<void> {
   loading.value = true
   try {
-    // 并行拉桥接与面板：面板列表供表单下拉，失败不阻断桥接列表展示。
-    const [bs, ps] = await Promise.allSettled([api.listBridges(), api.listPanels()])
+    // 并行拉桥接、面板、同步状态：面板供下拉，同步状态供卡片灯，
+    // 二者失败都不阻断桥接列表展示。
+    const [bs, ps, ss] = await Promise.allSettled([
+      api.listBridges(),
+      api.listPanels(),
+      api.getSyncStatus(),
+    ])
     if (bs.status === 'fulfilled') {
       bridges.value = bs.value
     } else {
@@ -117,6 +144,11 @@ async function refresh(): Promise<void> {
       panels.value = ps.value
     } else {
       console.warn(ps.reason)
+    }
+    if (ss.status === 'fulfilled') {
+      syncStatus.value = ss.value.bridges ?? {}
+    } else {
+      console.warn(ss.reason)
     }
   } finally {
     loading.value = false
@@ -318,11 +350,34 @@ onMounted(refresh)
              group-hover 时浮按钮 opacity 100；focus-within 让键盘 Tab
              导航时按钮也可见——纯 hover 隐藏会让键盘用户找不到操作。 -->
         <div class="flex items-center justify-between border-t pt-3">
-          <span class="text-xs font-medium" :class="b.enable
-            ? 'text-brand-700 dark:text-brand-400'
-            : 'text-muted-foreground'">
-            {{ b.enable ? t('common.enabled') : t('common.disabled') }}
-          </span>
+          <div class="flex items-center gap-2">
+            <span class="text-xs font-medium" :class="b.enable
+              ? 'text-brand-700 dark:text-brand-400'
+              : 'text-muted-foreground'">
+              {{ b.enable ? t('common.enabled') : t('common.disabled') }}
+            </span>
+            <!-- 最近同步聚合灯（fork 可观测性扩展） -->
+            <span
+              v-if="b.enable"
+              class="inline-flex items-center gap-1 text-[11px]"
+              :class="{
+                'text-brand-700 dark:text-brand-400': bridgeSyncState(b.name) === 'ok',
+                'text-destructive': bridgeSyncState(b.name) === 'fail',
+                'text-muted-foreground': bridgeSyncState(b.name) === 'pending',
+              }"
+              :title="bridgeSyncState(b.name) === 'fail' ? bridgeSyncFailMsg(b.name) : ''"
+            >
+              <LiveDot
+                :status="bridgeSyncState(b.name) === 'ok' ? 'on' : bridgeSyncState(b.name) === 'fail' ? 'off' : 'warn'"
+                size="sm"
+              />
+              {{
+                bridgeSyncState(b.name) === 'ok' ? t('bridges.syncOk')
+                : bridgeSyncState(b.name) === 'fail' ? t('bridges.syncFail')
+                : t('bridges.syncPending')
+              }}
+            </span>
+          </div>
           <!--
             按钮揭示策略：触屏（pointer: coarse）常显，鼠标用户 hover/focus 才显示
             （v0.7 第 2 轮 Codex minor 反馈 #7 修复）。.reveal-on-hover 工具类

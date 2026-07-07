@@ -13,7 +13,7 @@
 // i18n：所有 panels.* / common.* 文案走 t()。
 import { ref, onMounted, computed } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { Plus, Pencil, Trash2, Loader2, AlertCircle, Server } from 'lucide-vue-next'
+import { Plus, Pencil, Trash2, Loader2, AlertCircle, CheckCircle2, Server, Plug } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -64,6 +64,28 @@ const form = ref({
 const deleteOpen = ref(false)
 const deletingPanel = ref<XuiPanel | null>(null)
 
+// 「测试连接」状态：testing=进行中；testResult=最近一次结果（抽屉关闭时清空）。
+const testing = ref(false)
+const testResult = ref<{ ok: boolean; message: string } | null>(null)
+
+async function testConnection(): Promise<void> {
+  testResult.value = null
+  if (!form.value.api_host) {
+    testResult.value = { ok: false, message: t('panels.errHostEmpty') }
+    return
+  }
+  testing.value = true
+  try {
+    const r = await api.testPanel(form.value)
+    testResult.value = { ok: r.ok, message: r.message }
+  } catch (e) {
+    // 400（参数不合法）等非 200 走这里：ApiError.message 已是后端中文提示。
+    testResult.value = { ok: false, message: (e as Error).message || t('errors.requestFailed') }
+  } finally {
+    testing.value = false
+  }
+}
+
 const drawerTitle = computed(() =>
   editingName.value ? t('panels.editTitle', { name: editingName.value }) : t('panels.addTitle'),
 )
@@ -91,6 +113,7 @@ function openCreate(): void {
     skip_tls_verify: false,
   }
   formError.value = ''
+  testResult.value = null
   drawerOpen.value = true
 }
 
@@ -105,6 +128,7 @@ function openEdit(p: XuiPanel): void {
     skip_tls_verify: p.skip_tls_verify,
   }
   formError.value = ''
+  testResult.value = null
   drawerOpen.value = true
 }
 
@@ -354,6 +378,32 @@ onMounted(refresh)
           <div class="flex items-center gap-3">
             <Checkbox id="panel-skip-tls" v-model="form.skip_tls_verify" />
             <Label for="panel-skip-tls" class="cursor-pointer">{{ t('panels.skipTlsLabel') }}</Label>
+          </div>
+
+          <!-- 测试连接：探测表单当前值，不落库 -->
+          <div class="space-y-2">
+            <Button
+              type="button"
+              variant="outline"
+              class="w-full"
+              :disabled="testing"
+              :aria-busy="testing"
+              @click="testConnection"
+            >
+              <Loader2 v-if="testing" class="animate-spin" aria-hidden="true" />
+              <Plug v-else aria-hidden="true" />
+              {{ testing ? t('panels.testing') : t('panels.testBtn') }}
+            </Button>
+            <Alert
+              v-if="testResult"
+              :variant="testResult.ok ? 'success' : 'destructive'"
+              role="status"
+              aria-live="polite"
+            >
+              <CheckCircle2 v-if="testResult.ok" />
+              <AlertCircle v-else />
+              <AlertDescription>{{ testResult.message }}</AlertDescription>
+            </Alert>
           </div>
 
           <Alert v-if="formError" variant="destructive" role="alert" aria-live="assertive">

@@ -50,6 +50,7 @@ import (
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/logger"
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/store"
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/supervisor"
+	"github.com/xboard-bridge/xboard-xui-bridge/internal/syncstatus"
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/web"
 )
 
@@ -232,8 +233,12 @@ func runDaemon(args []string) {
 		}
 	}
 
+	// 同步状态注册表：进程内单例，跨引擎 reload 存活。供 sync 引擎写入、
+	// Web 面板读取（桥接级"最近同步"展示）。
+	syncReg := syncstatus.New()
+
 	// 装配 supervisor。
-	sup, err := supervisor.New(cfg, log, st)
+	sup, err := supervisor.New(cfg, log, st, syncReg)
 	if err != nil {
 		log.Error("装配 Supervisor 失败", "err", err)
 		os.Exit(2)
@@ -258,7 +263,7 @@ func runDaemon(args []string) {
 	auth.LogBootstrap(log, bootstrap)
 
 	// 装配 Web 面板。
-	webSrv, err := web.New(cfg, log, st, sup, authSvc)
+	webSrv, err := web.New(cfg, log, st, sup, authSvc, syncReg)
 	if err != nil {
 		log.Error("装配 Web 面板失败", "err", err)
 		os.Exit(2)

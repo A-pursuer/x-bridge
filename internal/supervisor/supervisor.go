@@ -40,6 +40,7 @@ import (
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/config"
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/store"
 	syncengine "github.com/xboard-bridge/xboard-xui-bridge/internal/sync"
+	"github.com/xboard-bridge/xboard-xui-bridge/internal/syncstatus"
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/xboard"
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/xui"
 )
@@ -60,6 +61,9 @@ type Supervisor struct {
 	log     *slog.Logger
 	rootLog *slog.Logger
 	store   store.Store
+	// reg 是同步状态注册表，跨 reload 存活（在 main 创建后注入），
+	// buildEngine 把它传给每一代 engine 让 worker 写入。
+	reg *syncstatus.Registry
 
 	// cfg 当前生效的配置；Reload 成功时被替换。Run 启动期间也是这个值。
 	cfg *config.Root
@@ -99,7 +103,7 @@ type engineHandle struct {
 // 时引擎已经发起上游请求的怪异状态。
 //
 // cfg 必须已通过 config.Validate（LoadFromStore 出来的实例已经过校验）。
-func New(cfg *config.Root, log *slog.Logger, st store.Store) (*Supervisor, error) {
+func New(cfg *config.Root, log *slog.Logger, st store.Store, reg *syncstatus.Registry) (*Supervisor, error) {
 	if cfg == nil {
 		return nil, errors.New("supervisor: cfg 不可为 nil")
 	}
@@ -109,10 +113,14 @@ func New(cfg *config.Root, log *slog.Logger, st store.Store) (*Supervisor, error
 	if st == nil {
 		return nil, errors.New("supervisor: store 不可为 nil")
 	}
+	if reg == nil {
+		return nil, errors.New("supervisor: reg 不可为 nil")
+	}
 	return &Supervisor{
 		log:     log.With("module", "supervisor"),
 		rootLog: log,
 		store:   st,
+		reg:     reg,
 		cfg:     cfg,
 	}, nil
 }
@@ -321,7 +329,7 @@ func (s *Supervisor) buildEngine(cfg *config.Root) (*syncengine.Engine, error) {
 		}
 		xuiClients[name] = c
 	}
-	eng, err := syncengine.New(cfg, s.rootLog, xboardC, xuiClients, s.store)
+	eng, err := syncengine.New(cfg, s.rootLog, xboardC, xuiClients, s.store, s.reg)
 	if err != nil {
 		return nil, fmt.Errorf("装配同步引擎：%w", err)
 	}

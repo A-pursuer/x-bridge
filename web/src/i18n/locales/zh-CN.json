@@ -161,7 +161,10 @@
     "fieldPanel": "所属 3x-ui 面板",
     "panelPlaceholder": "选择面板",
     "errPanelEmpty": "请选择所属 3x-ui 面板（如列表为空，请先在「3x-ui 面板」页创建）",
-    "tablePanel": "3x-ui 面板"
+    "tablePanel": "3x-ui 面板",
+    "syncOk": "同步正常",
+    "syncFail": "同步失败",
+    "syncPending": "等待同步"
   },
   "settings": {
     "title": "运行参数",
@@ -282,6 +285,8 @@
     "okUpdated": "面板已保存",
     "okDeleted": "面板 {name} 已删除",
     "emptyTitle": "还没有任何 3x-ui 面板",
-    "emptyHint": "先添加一台 3x-ui 面板，然后到「桥接管理」为它创建桥接"
+    "emptyHint": "先添加一台 3x-ui 面板，然后到「桥接管理」为它创建桥接",
+    "testBtn": "测试连接",
+    "testing": "测试中…"
   }
 }
