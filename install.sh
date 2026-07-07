@@ -99,7 +99,7 @@ err_trap() {
 trap err_trap ERR
 
 # ---------------- 常量 ----------------
-GITHUB_REPO="ZeroStarlet/xboard-xui-bridge"
+GITHUB_REPO="A-pursuer/xboard-xui-bridge"
 INSTALL_DIR="/usr/local/xboard-xui-bridge"
 DATA_DIR="${INSTALL_DIR}/data"
 BACKUP_DIR="${INSTALL_DIR}/backups"
