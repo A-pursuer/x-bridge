@@ -38,6 +38,13 @@ type commonResp struct {
 	Obj     json.RawMessage `json:"obj"`
 }
 
+// ClientIpEntry 是 3x-ui v3.5+ /panel/api/clients/clientIpsByGuid 返回的 IP
+// 记录形态。timestamp 仅用于排序/新鲜度，alive 上报只需要 IP 字符串。
+type ClientIpEntry struct {
+	IP        string `json:"ip"`
+	Timestamp int64  `json:"timestamp"`
+}
+
 // Inbound 是 GET /panel/api/inbounds/get/:id 返回的单条记录。
 //
 // 字段映射 3x-ui database/model.Inbound（部分），仅暴露中间件需要的字段。
@@ -47,12 +54,12 @@ type Inbound struct {
 	Remark         string          `json:"remark"`
 	Listen         string          `json:"listen"`
 	Port           int             `json:"port"`
-	Protocol       string          `json:"protocol"`        // vless / vmess / trojan / shadowsocks / hysteria2 ...
-	Tag            string          `json:"tag"`             // inbound-<port>，xray 内部唯一标识
+	Protocol       string          `json:"protocol"` // vless / vmess / trojan / shadowsocks / hysteria2 ...
+	Tag            string          `json:"tag"`      // inbound-<port>，xray 内部唯一标识
 	Enable         bool            `json:"enable"`
-	RawSettings    json.RawMessage `json:"settings"`        // 仍是 JSON 字符串而非对象
-	StreamSettings json.RawMessage `json:"streamSettings"`  // 同上
-	Sniffing       json.RawMessage `json:"sniffing"`        // 同上
+	RawSettings    json.RawMessage `json:"settings"`       // 仍是 JSON 字符串而非对象
+	StreamSettings json.RawMessage `json:"streamSettings"` // 同上
+	Sniffing       json.RawMessage `json:"sniffing"`       // 同上
 	// ClientStats 仅在 /panel/api/inbounds/list 返回的 inbound 中可用——
 	// 3x-ui 主线 InboundService.GetInbounds(userId) 显式 Preload("ClientStats")
 	// 并跑 enrichClientStats 填充每条 stats 的 UUID/SubId 字段。

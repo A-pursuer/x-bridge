@@ -105,6 +105,14 @@ type StatusReport struct {
 	Disk StatusPair `json:"disk"`
 }
 
+// Report 是 POST /api/v2/server/report 的聚合请求体。本中间件只把状态型
+// 数据（alive/status）放进该接口；traffic 继续走 /push 以保持计费
+// baseline 推进语义清晰。
+type Report struct {
+	Alive  AliveMap      `json:"alive,omitempty"`
+	Status *StatusReport `json:"status,omitempty"`
+}
+
 // StatusPair 描述 total / used 两元组（单位：字节）。
 type StatusPair struct {
 	Total uint64 `json:"total"`

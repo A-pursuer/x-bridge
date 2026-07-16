@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	stdsync "sync"
@@ -11,9 +13,10 @@ import (
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/protocol"
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/store"
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/xboard"
+	"github.com/xboard-bridge/xboard-xui-bridge/internal/xui"
 )
 
-// syncAlive 把 3x-ui 端"在线 client + 其使用的 IP"上报到 Xboard /alive。
+// syncAlive 把 3x-ui 端"在线 client + 其使用的 IP"上报到 Xboard /report(alive)。
 //
 // 算法：
 //
@@ -21,7 +24,7 @@ import (
 //     该 inbound 内的 email 集合 myEmails。
 //  2. 拉全局在线 email（GetOnlines）取 onlineAll。
 //  3. onlineMine = onlineAll ∩ myEmails；逐个调 GetClientIPs 解析最近 IP。
-//  4. 把 (xboard_user_id → [ip...]) 形态写入 AliveMap，调 PushAlive 上报。
+//  4. 把 (xboard_user_id → [ip...]) 形态写入 AliveMap，调 /report 上报 alive 字段。
 //
 // 并发：GetClientIPs 是逐个 email 的串行接口，inbound 内在线用户多时延迟会显著。
 //
@@ -32,7 +35,7 @@ import (
 //	a) 某个 email 拉 IPs 失败：返回错误中断本次循环；下个周期完整重做（在
 //	   线 IP 是状态而非增量，重做幂等且不丢数据）。v0.5.x 时代的"逐个跳过
 //	   失败 email"已被移除——失败信号必须显式可见，而不是被静默吞掉。
-//	b) PushAlive 失败：返回错误中断本次循环；语义同上。
+//	b) /report(alive) 失败：返回错误中断本次循环；语义同上。
 //
 // v0.6 关键变更：移除 placeholder IP 兜底
 //
@@ -76,10 +79,6 @@ func (w *bridgeWorker) syncAlive(ctx context.Context) error {
 	}
 
 	// 求交集，并把 email 翻译成 (xboard_user_id, uuid)；过滤掉 baseline 缺失的。
-	type liveTarget struct {
-		email        string
-		xboardUserID int64
-	}
 	var targets []liveTarget
 	for _, email := range online {
 		if _, ok := myEmails[email]; !ok {
@@ -95,63 +94,13 @@ func (w *bridgeWorker) syncAlive(ctx context.Context) error {
 		targets = append(targets, liveTarget{email: email, xboardUserID: bl.XboardUserID})
 	}
 
-	// 受限并发地拉每个 email 的当前 IP。
-	//
-	// 错误传播（v0.6 起）：任意一个 GetClientIPs 失败 → 通过 errOnce 抓取
-	// 第一个错误，等所有 goroutine 退出后整体返回；不再"逐个跳过失败 email
-	// 继续"——单一正向路径承诺要求失败显式可见。3x-ui 面板侧通常返回快速
-	// 失败（连接错误 / 5xx），单个 email 的失败极大概率是面板整体异常，
-	// 让本周期整体失败远比"部分上报"友好。
-	const maxConcurrency = 8
-	sem := make(chan struct{}, maxConcurrency)
-
-	type ipResult struct {
-		userID int64
-		ips    []string
-	}
-	results := make([]ipResult, len(targets))
-
-	var (
-		wg      stdsync.WaitGroup
-		errOnce stdsync.Once
-		firstErr error
-	)
-	for i := range targets {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				return
-			}
-			t := targets[idx]
-			raw, err := w.xuiC.GetClientIPs(ctx, t.email)
-			if err != nil {
-				// 一旦任一 email 拉 IP 失败，整体上报视为失败：本周期不
-				// 调 PushAlive，下周期完整重做。捕获首个错误供主 goroutine
-				// 返回；后续 goroutine 仍会执行（让它们正常退出 sem 不
-				// 阻塞），但其结果会被丢弃。
-				errOnce.Do(func() {
-					firstErr = fmt.Errorf("alive 拉 IP %s：%w", t.email, err)
-				})
-				return
-			}
-			ips := extractIPs(raw)
-			// v0.6 起 ips 为空时不再走 placeholder 兜底——直接保留为
-			// nil 切片，后续 alive 拼装阶段按"无 IP 即不上报该 user"
-			// 的规则处理。
-			results[idx] = ipResult{userID: t.xboardUserID, ips: ips}
-		}(i)
-	}
-	wg.Wait()
+	results, source, err := w.collectAliveIPs(ctx, targets, log)
 	if ctx.Err() != nil {
 		// 外部已取消，不再上报。
 		return ctx.Err()
 	}
-	if firstErr != nil {
-		return firstErr
+	if err != nil {
+		return err
 	}
 
 	// 拼装 AliveMap：key 是 user_id 字符串。
@@ -171,11 +120,143 @@ func (w *bridgeWorker) syncAlive(ctx context.Context) error {
 		alive[key] = mergeUnique(alive[key], r.ips)
 	}
 
-	if err := w.xboardC.PushAlive(ctx, w.cfg.XboardNodeID, w.cfg.XboardNodeType, alive); err != nil {
-		return fmt.Errorf("Xboard /alive：%w", err)
+	if err := w.xboardC.PushReport(ctx, w.cfg.XboardNodeID, w.cfg.XboardNodeType, xboard.Report{Alive: alive}); err != nil {
+		return fmt.Errorf("Xboard /report(alive)：%w", err)
 	}
-	log.Info("alive 上报完成", "user_count", len(alive))
+	log.Info("alive 上报完成", "user_count", len(alive), "alive_ip_source", source)
 	return nil
+}
+
+type liveTarget struct {
+	email        string
+	xboardUserID int64
+}
+
+type ipResult struct {
+	userID int64
+	ips    []string
+}
+
+func (w *bridgeWorker) collectAliveIPs(ctx context.Context, targets []liveTarget, log *slog.Logger) ([]ipResult, string, error) {
+	results := make([]ipResult, len(targets))
+	if len(targets) == 0 {
+		return results, "none", nil
+	}
+
+	panelGuid, guidErr := w.xuiC.GetPanelGuid(ctx)
+	if guidErr != nil {
+		log.Debug("alive 批量 IP：panelGuid 获取失败，仍尝试批量树并允许回退", "err", guidErr)
+	}
+	tree, err := w.xuiC.GetClientIPsByGuid(ctx)
+	if err != nil {
+		log.Warn("alive 批量 IP 拉取失败，回退逐 email 拉取", "err", err)
+		legacy, legacyErr := w.collectAliveIPsLegacy(ctx, targets)
+		return legacy, "fallback", legacyErr
+	}
+
+	var missing []liveTarget
+	for i, t := range targets {
+		ips := extractBatchIPs(tree, t.email)
+		if len(ips) == 0 {
+			missing = append(missing, t)
+			continue
+		}
+		results[i] = ipResult{userID: t.xboardUserID, ips: ips}
+	}
+	if len(missing) == 0 {
+		log.Debug("alive 批量 IP 命中", "panel_guid", panelGuid, "target_count", len(targets))
+		return results, "batch", nil
+	}
+
+	legacy, legacyErr := w.collectAliveIPsLegacy(ctx, missing)
+	if legacyErr != nil {
+		return nil, "batch+fallback", legacyErr
+	}
+	legacyIdx := 0
+	for i := range targets {
+		if len(results[i].ips) != 0 {
+			continue
+		}
+		results[i] = legacy[legacyIdx]
+		legacyIdx++
+	}
+	log.Debug("alive 批量 IP 部分命中，缺失项回退逐 email 拉取",
+		"panel_guid", panelGuid,
+		"target_count", len(targets),
+		"fallback_count", len(missing),
+	)
+	return results, "batch+fallback", nil
+}
+
+func (w *bridgeWorker) collectAliveIPsLegacy(ctx context.Context, targets []liveTarget) ([]ipResult, error) {
+	const maxConcurrency = 8
+	sem := make(chan struct{}, maxConcurrency)
+	results := make([]ipResult, len(targets))
+
+	var (
+		wg       stdsync.WaitGroup
+		errOnce  stdsync.Once
+		firstErr error
+	)
+	for i := range targets {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+			t := targets[idx]
+			raw, err := w.xuiC.GetClientIPs(ctx, t.email)
+			if err != nil {
+				errOnce.Do(func() {
+					firstErr = fmt.Errorf("alive 拉 IP %s：%w", t.email, err)
+				})
+				return
+			}
+			results[idx] = ipResult{userID: t.xboardUserID, ips: extractIPs(raw)}
+		}(i)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return results, nil
+}
+
+func extractBatchIPs(tree map[string]map[string][]xui.ClientIpEntry, email string) []string {
+	type observed struct {
+		ip string
+		ts int64
+	}
+	latest := map[string]int64{}
+	for _, perEmail := range tree {
+		for _, entry := range perEmail[email] {
+			if entry.IP == "" {
+				continue
+			}
+			if cur, ok := latest[entry.IP]; !ok || entry.Timestamp > cur {
+				latest[entry.IP] = entry.Timestamp
+			}
+		}
+	}
+	entries := make([]observed, 0, len(latest))
+	for ip, ts := range latest {
+		entries = append(entries, observed{ip: ip, ts: ts})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].ts == entries[j].ts {
+			return entries[i].ip < entries[j].ip
+		}
+		return entries[i].ts > entries[j].ts
+	})
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.ip)
+	}
+	return out
 }
 
 // extractIPs 把 3x-ui clientIps 的字符串数组解析为纯 IP 列表。

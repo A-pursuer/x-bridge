@@ -127,7 +127,7 @@ func (c *Client) FetchUsers(ctx context.Context, nodeID int, nodeType string) (*
 //     "v0.6 移除 [0, 0] 心跳兜底"段落。
 //   - 节点 STATUS_ONLINE / STATUS_ONLINE_NO_PUSH 切换完全交给 Xboard 端
 //     原生判定逻辑：5 分钟内无真实流量即 STATUS_ONLINE_NO_PUSH。中间件
-//     不再构造伪 [0, 0] 占位项欺骗判定。status_sync 的 /status 端点只
+//     不再构造伪 [0, 0] 占位项欺骗判定。status_sync 的 /report(status) 只
 //     刷新 LAST_LOAD_AT 缓存（节点负载条），与 available_status 判定无关
 //     ——v0.4 之前老注释一度写"心跳保活靠 status_sync"，那是错的，已在
 //     v0.5 修正；v0.6 进一步移除 traffic_sync 的占位心跳路径，让节点状态
@@ -205,6 +205,23 @@ func (c *Client) PushStatus(ctx context.Context, nodeID int, nodeType string, st
 		return err
 	}
 	return assertDataTrue(resp.Body, "/api/v2/server/status")
+}
+
+// PushReport 调用 POST /api/v2/server/report 聚合上报状态型数据。
+//
+// 注意：本方法不承载 traffic。流量仍必须走 PushTraffic，确保 /push 成功
+// 与本地 baseline 推进保持一一对应。
+func (c *Client) PushReport(ctx context.Context, nodeID int, nodeType string, report Report) error {
+	q := c.baseQuery(nodeID, nodeType)
+	resp, err := c.do(ctx, http.MethodPost, "/api/v2/server/report", q, report)
+	if err != nil {
+		return err
+	}
+	defer drainAndClose(resp.Body)
+	if err := assertHTTPOK(resp, "/api/v2/server/report"); err != nil {
+		return err
+	}
+	return assertDataTrue(resp.Body, "/api/v2/server/report")
 }
 
 // baseQuery 构造 token / node_id / node_type 三元组，所有 V2 端点共用。

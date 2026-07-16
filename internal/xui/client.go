@@ -66,6 +66,10 @@ type Client struct {
 	// 把 Supervisor.log 传进来，与其它 component 共享同一日志输出。
 	logger *slog.Logger
 
+	panelGuidMu     sync.Mutex
+	panelGuid       string
+	panelGuidLoaded bool
+
 	// /panel/api/inbounds/list 端点的周期内合并缓存（v0.5.3）。
 	//
 	// 背景：traffic_sync 与 alive_sync 都通过 GetClientTrafficsByInboundID
@@ -389,18 +393,19 @@ func (c *Client) fetchInbounds(ctx context.Context) ([]Inbound, error) {
 // 会跟着卡。
 //
 // 处理策略：
-//   a) defer 中清理 inflight 槽位（无条件，含 panic 路径）；
-//   b) panic 时用 fmt.Errorf("xui.fetchInbounds panic: %v", rec) 包装成
-//      普通 error 写入 inflight.result 并 close(done)——所有 waiter 看到
-//      错误返回。该 error 不是 *xui.Error 类型（不携带 HTTPStatus / Endpoint
-//      等结构化字段），因为 panic 信息只有 stack-time 的 recover 值，没有
-//      请求层的元信息可填；上层 syncTraffic / syncAlive 只关心 err != nil
-//      即报"本周期失败"，无需类型断言；
-//   c) **不 re-panic**：本函数返回给调用方一个普通 error（含 panic 信息）。
-//      v0.8.4 之前曾用 panic(rec) 上抛，但 runStep 此前无 recover，会让整个
-//      Go 进程 crash；现 runStep 已加 recover，但此处仍走 error 返回更稳——
-//      让 sync 层按"本周期同步失败 + warn 日志"正常处理，与其它 HTTP /
-//      网络错误对齐，运维不需要区分"panic vs 网络抖动"两种异常路径。
+//
+//	a) defer 中清理 inflight 槽位（无条件，含 panic 路径）；
+//	b) panic 时用 fmt.Errorf("xui.fetchInbounds panic: %v", rec) 包装成
+//	   普通 error 写入 inflight.result 并 close(done)——所有 waiter 看到
+//	   错误返回。该 error 不是 *xui.Error 类型（不携带 HTTPStatus / Endpoint
+//	   等结构化字段），因为 panic 信息只有 stack-time 的 recover 值，没有
+//	   请求层的元信息可填；上层 syncTraffic / syncAlive 只关心 err != nil
+//	   即报"本周期失败"，无需类型断言；
+//	c) **不 re-panic**：本函数返回给调用方一个普通 error（含 panic 信息）。
+//	   v0.8.4 之前曾用 panic(rec) 上抛，但 runStep 此前无 recover，会让整个
+//	   Go 进程 crash；现 runStep 已加 recover，但此处仍走 error 返回更稳——
+//	   让 sync 层按"本周期同步失败 + warn 日志"正常处理，与其它 HTTP /
+//	   网络错误对齐，运维不需要区分"panic vs 网络抖动"两种异常路径。
 //
 // 并发不变量：c.listInflight 仅在持有 listMu 时被读 / 写；从 nil → 非 nil
 // 与 非 nil → nil 都在 listMu 临界区内完成。fetcher 释放 listMu 期间其它
@@ -729,6 +734,27 @@ func decodeClientIPObject(raw json.RawMessage) (string, bool, error) {
 	return ip, true, nil
 }
 
+// GetClientIPsByGuid 调用 POST /panel/api/clients/clientIpsByGuid，返回
+// 3x-ui 节点树内按 panelGuid/email 归属的 IP 记录。
+func (c *Client) GetClientIPsByGuid(ctx context.Context) (map[string]map[string][]ClientIpEntry, error) {
+	endpoint := "/panel/api/clients/clientIpsByGuid"
+	raw, err := c.do(ctx, http.MethodPost, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 || string(raw) == "null" {
+		return map[string]map[string][]ClientIpEntry{}, nil
+	}
+	var out map[string]map[string][]ClientIpEntry
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("解码 %s 响应：%w", endpoint, err)
+	}
+	if out == nil {
+		out = map[string]map[string][]ClientIpEntry{}
+	}
+	return out, nil
+}
+
 // GetOnlines 调用 POST /panel/api/clients/onlines；返回当前在线的 email 列表。
 //
 // 该数据是面板从本地 + 远程节点聚合得到，刷新周期约 10 秒。
@@ -758,16 +784,49 @@ func (c *Client) GetServerStatus(ctx context.Context) (json.RawMessage, error) {
 	return c.do(ctx, http.MethodGet, "/panel/api/server/status", nil)
 }
 
+// GetPanelGuid 从 /panel/api/server/status 读取并缓存 panelGuid。该值主要用于
+// 日志观测；批量 IP 路径会合并 clientIpsByGuid 的所有 guid 子树以保持与
+// /clients/ips/:email 的全量 IP 语义一致。
+func (c *Client) GetPanelGuid(ctx context.Context) (string, error) {
+	c.panelGuidMu.Lock()
+	if c.panelGuidLoaded {
+		guid := c.panelGuid
+		c.panelGuidMu.Unlock()
+		return guid, nil
+	}
+	c.panelGuidMu.Unlock()
+
+	raw, err := c.GetServerStatus(ctx)
+	if err != nil {
+		return "", err
+	}
+	var probe struct {
+		PanelGuid string `json:"panelGuid"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return "", fmt.Errorf("解码 /panel/api/server/status panelGuid：%w", err)
+	}
+	if probe.PanelGuid == "" {
+		return "", fmt.Errorf("/panel/api/server/status 未返回 panelGuid")
+	}
+
+	c.panelGuidMu.Lock()
+	c.panelGuid = probe.PanelGuid
+	c.panelGuidLoaded = true
+	c.panelGuidMu.Unlock()
+	return probe.PanelGuid, nil
+}
+
 // do 是所有面板 API 共享的传输层。
 //
 // 正向路径（与项目"单一正向路径"承诺一致）：
 //
-//	1. 序列化 body（如有）；
-//	2. 调 doOnce 用当前 baseURL 走"构造请求 → 注入 Bearer → 发 → 解码"四步；
-//	3. 成功立即返回；
-//	4. 仅当失败错误形态被 schemeSwapTarget 识别为"3x-ui 面板侧协议与
-//	   xui.api_host 配置的 scheme 不匹配"时（即 Go net/http 两条标志性
-//	   transport 错误），CAS 翻转 baseURL scheme 一次后重试一次。
+//  1. 序列化 body（如有）；
+//  2. 调 doOnce 用当前 baseURL 走"构造请求 → 注入 Bearer → 发 → 解码"四步；
+//  3. 成功立即返回；
+//  4. 仅当失败错误形态被 schemeSwapTarget 识别为"3x-ui 面板侧协议与
+//     xui.api_host 配置的 scheme 不匹配"时（即 Go net/http 两条标志性
+//     transport 错误），CAS 翻转 baseURL scheme 一次后重试一次。
 //
 // 为什么在此层做协议探测重试（而非更严格的"出错即失败"）：
 //
@@ -782,12 +841,12 @@ func (c *Client) GetServerStatus(ctx context.Context) (json.RawMessage, error) {
 //
 // 翻转语义：
 //
-//	1. 首次失败立即识别错误形态，无指数退避、无多轮 sniff；
-//	2. CAS 写：多 goroutine 并发触发时只有第一个真正改写 baseURL 并打
-//	   WARN，其它通过 CAS 失败回路直接走新 scheme 重试；
-//	3. 翻转后的重试仍然只算一次——若新 scheme 上仍报错（任何错误，无论
-//	   是否再匹配 schemeSwapTarget 条件）立即将该错误向上传播，不会出
-//	   现"http → https → http → ..." 反复抖动。
+//  1. 首次失败立即识别错误形态，无指数退避、无多轮 sniff；
+//  2. CAS 写：多 goroutine 并发触发时只有第一个真正改写 baseURL 并打
+//     WARN，其它通过 CAS 失败回路直接走新 scheme 重试；
+//  3. 翻转后的重试仍然只算一次——若新 scheme 上仍报错（任何错误，无论
+//     是否再匹配 schemeSwapTarget 条件）立即将该错误向上传播，不会出
+//     现"http → https → http → ..." 反复抖动。
 func (c *Client) do(ctx context.Context, method, endpoint string, body any) (json.RawMessage, error) {
 	var bodyBytes []byte
 	if body != nil {

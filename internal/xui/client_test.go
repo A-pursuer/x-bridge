@@ -111,18 +111,90 @@ func TestGetClientIPsRejectsUnexpectedShapes(t *testing.T) {
 	}
 }
 
+func TestGetOnlinesContract(t *testing.T) {
+	c := newRoutedTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requireRequest(t, r, http.MethodPost, "/panel/api/clients/onlines")
+		_, _ = w.Write([]byte(`{"success":true,"msg":"","obj":["a@example.com","b@example.com"]}`))
+	})
+	got, err := c.GetOnlines(context.Background())
+	if err != nil {
+		t.Fatalf("GetOnlines: %v", err)
+	}
+	want := []string{"a@example.com", "b@example.com"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("GetOnlines = %#v, want %#v", got, want)
+	}
+}
+
+func TestGetClientIPsByGuidContract(t *testing.T) {
+	c := newRoutedTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requireRequest(t, r, http.MethodPost, "/panel/api/clients/clientIpsByGuid")
+		_, _ = w.Write([]byte(`{"success":true,"msg":"","obj":{"guid-a":{"u@x":[{"ip":"1.1.1.1","timestamp":20},{"ip":"2.2.2.2","timestamp":10}]}}}`))
+	})
+	got, err := c.GetClientIPsByGuid(context.Background())
+	if err != nil {
+		t.Fatalf("GetClientIPsByGuid: %v", err)
+	}
+	want := map[string]map[string][]ClientIpEntry{
+		"guid-a": {"u@x": {{IP: "1.1.1.1", Timestamp: 20}, {IP: "2.2.2.2", Timestamp: 10}}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("GetClientIPsByGuid = %#v, want %#v", got, want)
+	}
+}
+
+func TestGetPanelGuidCachesServerStatus(t *testing.T) {
+	calls := 0
+	c := newRoutedTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requireRequest(t, r, http.MethodGet, "/panel/api/server/status")
+		calls++
+		_, _ = w.Write([]byte(`{"success":true,"msg":"","obj":{"panelGuid":"panel-guid","cpu":1,"mem":{"current":1,"total":2},"swap":{"current":0,"total":0},"disk":{"current":3,"total":4}}}`))
+	})
+	for i := 0; i < 2; i++ {
+		got, err := c.GetPanelGuid(context.Background())
+		if err != nil {
+			t.Fatalf("GetPanelGuid call %d: %v", i, err)
+		}
+		if got != "panel-guid" {
+			t.Fatalf("GetPanelGuid = %q", got)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("server status calls = %d, want 1", calls)
+	}
+}
+
+func TestAddClientBulkCreateContract(t *testing.T) {
+	c := newRoutedTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requireRequest(t, r, http.MethodPost, "/panel/api/clients/bulkCreate")
+		if got := r.URL.Query().Encode(); got != "" {
+			t.Fatalf("query = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"success":true,"msg":"","obj":{"created":1}}`))
+	})
+	err := c.AddClient(context.Background(), 7, []ClientSettings{{
+		Email: "u@x", ID: "uuid", Enable: true, LimitIP: 2,
+	}})
+	if err != nil {
+		t.Fatalf("AddClient: %v", err)
+	}
+}
+
+func TestAddClientBulkCreateSkippedFails(t *testing.T) {
+	c := newRoutedTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requireRequest(t, r, http.MethodPost, "/panel/api/clients/bulkCreate")
+		_, _ = w.Write([]byte(`{"success":true,"msg":"","obj":{"created":0,"skipped":[{"email":"u@x","reason":"email already in use"}]}}`))
+	})
+	err := c.AddClient(context.Background(), 7, []ClientSettings{{Email: "u@x", ID: "uuid"}})
+	if err == nil || !strings.Contains(err.Error(), "email already in use") {
+		t.Fatalf("AddClient err = %v", err)
+	}
+}
+
 func newTestClient(t *testing.T, obj string) *Client {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Fatalf("method = %s, want POST", r.Method)
-		}
-		if r.URL.Path != "/panel/api/clients/ips/user@example.com" {
-			t.Fatalf("path = %s", r.URL.Path)
-		}
-		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
-			t.Fatalf("Authorization = %q", got)
-		}
+		requireRequest(t, r, http.MethodPost, "/panel/api/clients/ips/user@example.com")
 		w.Header().Set("Content-Type", "application/json")
 		if obj == "" {
 			_, _ = w.Write([]byte(`{"success":true,"msg":""}`))
@@ -141,4 +213,35 @@ func newTestClient(t *testing.T, obj string) *Client {
 		t.Fatalf("New xui client: %v", err)
 	}
 	return c
+}
+
+func newRoutedTestClient(t *testing.T, handler http.HandlerFunc) *Client {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	c, err := New(config.Xui{
+		APIHost:    srv.URL,
+		APIToken:   "test-token",
+		TimeoutSec: 5,
+	}, nil)
+	if err != nil {
+		t.Fatalf("New xui client: %v", err)
+	}
+	return c
+}
+
+func requireRequest(t *testing.T, r *http.Request, method, path string) {
+	t.Helper()
+	if r.Method != method {
+		t.Fatalf("method = %s, want %s", r.Method, method)
+	}
+	if r.URL.Path != path {
+		t.Fatalf("path = %s, want %s", r.URL.Path, path)
+	}
+	if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := r.Header.Get("Accept"); got != "application/json" {
+		t.Fatalf("Accept = %q", got)
+	}
 }

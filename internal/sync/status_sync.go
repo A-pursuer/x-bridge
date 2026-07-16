@@ -8,7 +8,7 @@ import (
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/xboard"
 )
 
-// syncStatus 把节点负载信息上报到 Xboard /status。
+// syncStatus 把节点负载信息上报到 Xboard /report(status)。
 //
 // 数据来源：仅 3x-ui /panel/api/server/status——它跑在节点真机上，cpu /
 // mem / swap / disk 数据准确。
@@ -51,8 +51,8 @@ func (w *bridgeWorker) syncStatus(ctx context.Context) error {
 		return fmt.Errorf("解析 3x-ui server status：%w", err)
 	}
 
-	if err := w.xboardC.PushStatus(ctx, w.cfg.XboardNodeID, w.cfg.XboardNodeType, report); err != nil {
-		return fmt.Errorf("Xboard /status：%w", err)
+	if err := w.xboardC.PushReport(ctx, w.cfg.XboardNodeID, w.cfg.XboardNodeType, xboard.Report{Status: &report}); err != nil {
+		return fmt.Errorf("Xboard /report(status)：%w", err)
 	}
 	log.Debug("status 上报完成", "cpu", report.CPU, "mem_used", report.Mem.Used)
 	return nil
@@ -179,8 +179,8 @@ func parseStatusPair(fieldName string, raw json.RawMessage) (xboard.StatusPair, 
 
 	// 取实际"已用"指针：current 优先；其后再看 used；若都没提供则 hasUsed=false。
 	var (
-		usedVal  uint64
-		hasUsed  bool
+		usedVal uint64
+		hasUsed bool
 	)
 	switch {
 	case probe.Current != nil:
