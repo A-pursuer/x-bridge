@@ -59,6 +59,18 @@ func TestValidateDuplicatePanelName(t *testing.T) {
 	}
 }
 
+func TestValidateDuplicateBridgeNameAfterTrim(t *testing.T) {
+	r := baseValidRoot()
+	duplicate := r.Bridges[0]
+	duplicate.Name = "  " + duplicate.Name + "\t"
+	r.Bridges = append(r.Bridges, duplicate)
+
+	err := r.Validate()
+	if err == nil || !strings.Contains(err.Error(), "name 重复") {
+		t.Fatalf("trim 后的桥接重名应报错，实际：%v", err)
+	}
+}
+
 func TestValidateHysteria2NodeTypeMapping(t *testing.T) {
 	r := baseValidRoot()
 	r.Bridges[0].Protocol = "hysteria2"

@@ -87,6 +87,33 @@ func TestCountBridgesByPanel(t *testing.T) {
 	}
 }
 
+// TestCreateBridgeNormalizesNameBeforeInsert 回归曾导致整个热重载失效的
+// 视觉同名问题：SQLite 原本允许 "demo" 与 "demo " 同时存在，而配置加载
+// 会把二者都 trim 成 "demo" 并报重复。创建入口必须在 INSERT 前统一主键。
+func TestCreateBridgeNormalizesNameBeforeInsert(t *testing.T) {
+	ctx := context.Background()
+	st := openTemp(t)
+
+	bridge := BridgeRow{
+		Name: "  demo\t", XboardNodeID: 1, XuiPanel: "p1",
+		XuiInboundID: 1, Protocol: "vless", Enable: true,
+	}
+	if err := st.CreateBridge(ctx, bridge); err != nil {
+		t.Fatalf("CreateBridge：%v", err)
+	}
+	if _, err := st.GetBridge(ctx, "demo"); err != nil {
+		t.Fatalf("规范化后的 name 应为 demo：%v", err)
+	}
+	if _, err := st.GetBridge(ctx, bridge.Name); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("未经规范化的原 name 不应落库，实际：%v", err)
+	}
+
+	bridge.Name = "demo"
+	if err := st.CreateBridge(ctx, bridge); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("规范化后的同名创建应返回 ErrAlreadyExists，实际：%v", err)
+	}
+}
+
 // TestBridgeRoundTripPanelField 确认 xui_panel 列在写入/读取往返中不丢。
 func TestBridgeRoundTripPanelField(t *testing.T) {
 	ctx := context.Background()

@@ -87,6 +87,9 @@ func (s *Server) handleCreateBridge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	row := bridgeFromRequest(req)
+	// 与 config.Validate / store.CreateBridge 使用同一规范：名称先 trim 再
+	// 作为主键落库，杜绝 "demo" 与 "demo " 这类视觉同名记录。
+	row.Name = strings.TrimSpace(row.Name)
 	// 面板引用预检（fork 多面板扩展）：悬空引用若直接落库，reload 时
 	// config.Validate 会失败并让 handler 返回 5xx——语义正确但对用户不友好。
 	// 这里查一次真相源（xui_panels 表）提前给 400；不复制格式校验逻辑。
@@ -141,8 +144,8 @@ func (s *Server) handleCreateBridge(w http.ResponseWriter, r *http.Request) {
 //
 // 路径参数 {name} 必须与 body.name 一致——避免 URL 拼写漂移。
 func (s *Server) handleUpdateBridge(w http.ResponseWriter, r *http.Request) {
-	pathName := strings.TrimSpace(r.PathValue("name"))
-	if pathName == "" {
+	pathName, ok := exactBridgePathName(r)
+	if !ok {
 		s.writeError(w, http.StatusBadRequest, errCodeBadRequest, "URL 缺少 name")
 		return
 	}
@@ -151,7 +154,7 @@ func (s *Server) handleUpdateBridge(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, errCodeBadRequest, "请求体格式错误")
 		return
 	}
-	if strings.TrimSpace(req.Name) != pathName {
+	if req.Name != pathName {
 		s.writeError(w, http.StatusBadRequest, errCodeBadRequest, "URL 中的 name 与 body 中的 name 不一致")
 		return
 	}
@@ -248,8 +251,11 @@ func (s *Server) handleUpdateBridge(w http.ResponseWriter, r *http.Request) {
 // 一旦写库成功，后续清理就必须跑完，不再受请求生命周期约束。30s 上限避
 // 免 handler goroutine 因 reload 卡死被永久占用。
 func (s *Server) handleDeleteBridge(w http.ResponseWriter, r *http.Request) {
-	name := strings.TrimSpace(r.PathValue("name"))
-	if name == "" {
+	// 不可 trim 后再删除：旧版本可能已写入带首尾空白的脏主键。如果这里
+	// 把 "demo " 改成 "demo"，会误删正常记录且让脏记录永远无法从 GUI
+	// 清除。新建路径已经统一规范化；这里保留精确值用于兼容存量数据。
+	name, ok := exactBridgePathName(r)
+	if !ok {
 		s.writeError(w, http.StatusBadRequest, errCodeBadRequest, "URL 缺少 name")
 		return
 	}
@@ -312,6 +318,14 @@ func (s *Server) handleDeleteBridge(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 	s.writeJSON(w, http.StatusOK, struct{}{})
+}
+
+// exactBridgePathName 返回 URL 中解码后的原始 bridge 主键，并只用 TrimSpace
+// 判断它是否为空。返回值本身绝不能 trim：这是删除旧版本遗留空白主键的
+// 恢复通道，也是避免把 "demo " 错删成 "demo" 的关键不变量。
+func exactBridgePathName(r *http.Request) (string, bool) {
+	name := r.PathValue("name")
+	return name, strings.TrimSpace(name) != ""
 }
 
 // checkPanelRef 校验桥接引用的面板名非空且存在于 xui_panels 表。

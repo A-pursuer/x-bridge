@@ -190,7 +190,7 @@ function openEdit(b: Bridge): void {
 
 async function submit(): Promise<void> {
   formError.value = ''
-  if (!form.value.name) {
+  if (!form.value.name.trim()) {
     formError.value = t('bridges.errNameEmpty')
     return
   }
@@ -208,7 +208,8 @@ async function submit(): Promise<void> {
       await api.updateBridge(editingName.value, form.value)
       toast({ title: t('bridges.okUpdated'), variant: 'success' })
     } else {
-      await api.createBridge(form.value)
+      // 后端同样会规范化；前端先 trim 可让表单与最终保存值保持一致。
+      await api.createBridge({ ...form.value, name: form.value.name.trim() })
       toast({ title: t('bridges.okCreated'), variant: 'success' })
     }
     drawerOpen.value = false

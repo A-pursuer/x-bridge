@@ -1040,7 +1040,11 @@ WHERE name = ?;
 // 为了让"GUI 表单 → 持久层"的链路在每一段都拒绝非法输入，避免因前端逻辑
 // 漏校验导致脏数据落库。
 func (s *sqliteStore) CreateBridge(ctx context.Context, b BridgeRow) error {
-	if strings.TrimSpace(b.Name) == "" {
+	// name 是 bridges 的业务主键。必须先规范化再落库，否则 SQLite 会把
+	// "demo" 与 "demo " 视为两个不同主键，而 config.Validate 又会在加载
+	// 时 trim 成同一个名字，导致整个热重载永久失败。
+	name := strings.TrimSpace(b.Name)
+	if name == "" {
 		return errors.New("CreateBridge: name 不可为空")
 	}
 	if strings.TrimSpace(b.Protocol) == "" {
@@ -1053,15 +1057,15 @@ INSERT INTO bridges (name, xboard_node_id, xboard_node_type, xui_panel, xui_inbo
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 `
 	if _, err := s.db.ExecContext(ctx, stmt,
-		b.Name, b.XboardNodeID, b.XboardNodeType, b.XuiPanel, b.XuiInboundID,
+		name, b.XboardNodeID, b.XboardNodeType, b.XuiPanel, b.XuiInboundID,
 		b.Protocol, b.Flow, boolToInt(b.Enable), now, now,
 	); err != nil {
 		if isUniqueConstraintError(err) {
 			// 把 name 信息保留在外层 message，同时让 errors.Is(err, ErrAlreadyExists)
 			// 仍然为 true——双层 wrap 通过 %w 实现链式 unwrap。
-			return fmt.Errorf("CreateBridge %q：%w", b.Name, ErrAlreadyExists)
+			return fmt.Errorf("CreateBridge %q：%w", name, ErrAlreadyExists)
 		}
-		return fmt.Errorf("CreateBridge %q：%w", b.Name, err)
+		return fmt.Errorf("CreateBridge %q：%w", name, err)
 	}
 	return nil
 }
