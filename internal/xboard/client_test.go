@@ -84,6 +84,54 @@ func TestPushReportRejectsDataFalse(t *testing.T) {
 	}
 }
 
+func TestMultiSubscriptionUIDsRemainIndependentAcrossFetchAndTrafficPush(t *testing.T) {
+	const (
+		streamingSubscriptionID = int64(4101)
+		broadbandSubscriptionID = int64(4102)
+	)
+	var gotTraffic PushTraffic
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/server/user":
+			requireXboardRequest(t, r, http.MethodGet, "/api/v2/server/user")
+			w.Header().Set("ETag", `"multi-subscription"`)
+			_, _ = w.Write([]byte(`{"users":[{"id":4101,"uuid":"11111111-1111-4111-8111-111111111111","speed_limit":0,"device_limit":2},{"id":4102,"uuid":"22222222-2222-4222-8222-222222222222","speed_limit":100,"device_limit":4}]}`))
+		case "/api/v2/server/push":
+			requireXboardRequest(t, r, http.MethodPost, "/api/v2/server/push")
+			if err := json.NewDecoder(r.Body).Decode(&gotTraffic); err != nil {
+				t.Fatalf("decode traffic: %v", err)
+			}
+			_, _ = w.Write([]byte(`{"data":true}`))
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(config.Xboard{APIHost: srv.URL, Token: "server-token", TimeoutSec: 5})
+	users, err := c.FetchUsers(context.Background(), 7, "vless")
+	if err != nil {
+		t.Fatalf("FetchUsers: %v", err)
+	}
+	if len(users.Users) != 2 || users.Users[0].ID != streamingSubscriptionID || users.Users[1].ID != broadbandSubscriptionID {
+		t.Fatalf("subscription UIDs = %#v", users.Users)
+	}
+	if users.ETag != `"multi-subscription"` {
+		t.Fatalf("ETag = %q", users.ETag)
+	}
+
+	traffic := PushTraffic{}
+	traffic.Set(streamingSubscriptionID, 101, 201)
+	traffic.Set(broadbandSubscriptionID, 102, 202)
+	if err := c.PushTraffic(context.Background(), 7, "vless", traffic); err != nil {
+		t.Fatalf("PushTraffic: %v", err)
+	}
+	if !reflect.DeepEqual(gotTraffic, traffic) {
+		t.Fatalf("traffic = %#v, want %#v", gotTraffic, traffic)
+	}
+}
+
 func requireXboardRequest(t *testing.T, r *http.Request, method, path string) {
 	t.Helper()
 	if r.Method != method {
@@ -95,7 +143,8 @@ func requireXboardRequest(t *testing.T, r *http.Request, method, path string) {
 	if got := r.Header.Get("Accept"); got != "application/json" {
 		t.Fatalf("Accept = %q", got)
 	}
-	if got := r.Header.Get("Content-Type"); got != "application/json" {
+	if method != http.MethodGet && r.Header.Get("Content-Type") != "application/json" {
+		got := r.Header.Get("Content-Type")
 		t.Fatalf("Content-Type = %q", got)
 	}
 }

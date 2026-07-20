@@ -23,7 +23,8 @@ import (
 //
 // 字段映射 ServerService.getAvailableUsers 的输出（Xboard 端只暴露这四列）：
 //
-//	id          : 用户主键，上报流量时作为 traffic map 的 key（字符串化）。
+//	id          : 节点计费 UID。V1 是用户 ID，XBoard 多订阅 V2 是订阅 ID；
+//	              Bridge 必须把它视为不透明主键，上报流量时原样作为 map key。
 //	uuid        : 客户端密码（除 SS-2022 外所有协议直接拿它当 password）。
 //	speed_limit : bps；0 表示不限速。
 //	device_limit: 最大设备数；0 表示不限。
@@ -80,12 +81,13 @@ func (p PushTraffic) Set(userID int64, upBytes, downBytes int64) {
 	p[strconv.FormatInt(userID, 10)] = [2]int64{upBytes, downBytes}
 }
 
-// AliveMap 是 alive 上报的字段；key 为 user_id 字符串，value 为该用户当前在线 IP 数组。
+// AliveMap 是 alive 上报的字段；key 为节点计费 UID 字符串，value 为该订阅当前在线 IP 数组。
 //
 // 例：{"1": ["1.2.3.4", "5.6.7.8"], "2": ["9.10.11.12"]}
 //
 // 用 string key 是因为 JSON 对象 key 必须是字符串，这是 Xboard ServerService
-// processAlive 端的硬性要求；不做 int 转换会导致 PHP 解析失败。
+// processAlive 端的硬性要求；不做 int 转换会导致 PHP 解析失败。多订阅模式下
+// UID 是 subscription_id，而不是 account user_id。
 type AliveMap map[string][]string
 
 // AliveListResp 是 GET /api/v2/server/alivelist 的响应。
