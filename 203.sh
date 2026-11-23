@@ -13,17 +13,18 @@
 #   UFW 不放行 8787（面板只走 Tailscale，公网无需可达）
 # - 安装后写 systemd drop-in 把监听地址改为 <TailscaleIP>:8787，并声明依赖
 #   tailscaled；开机若 Tailscale IP 尚未就绪，Restart=on-failure 会自动重试绑定
+# - 固定发行：v0.12.0，安装器与三架构tar摘要均已读回；不使用latest。
 # - 重复运行 = 升级：install.sh 自带旧二进制/数据库备份；监听 drop-in 幂等重写
 # - 前置：Tailscale 必须已安装并 up（本 snippet 检测不到 Tailscale IPv4 会直接退出）
 
 # 可长期保存到 Termius Snippet：
 GITHUB_REPO="A-pursuer/x-bridge"
 LISTEN_PORT="8787"
-BRIDGE_VERSION="v0.11.1-idempotency-20261123"
-BRIDGE_LOCAL_BINARY="/usr/local/lib/xbridge-selfhost/accepted/xboard-xui-bridge"
-BRIDGE_LOCAL_SHA256="cb5f2350e54266bdccd8850ba4efc4860c7729001eb2a55075f20eed58f98792"
-INSTALLER_LOCAL="/usr/local/lib/xbridge-selfhost/install.sh"
-INSTALLER_SHA256="426f897fa7b8ea57903e76832c99c09b5bc2f237ee53d9db45acdc233cfc824e"
+BRIDGE_VERSION="v0.12.0"
+BRIDGE_LOCAL_BINARY=""
+BRIDGE_LOCAL_SHA256=""
+INSTALLER_LOCAL=""
+INSTALLER_SHA256="4cbc558047ce9feff44869697a9cd4504a35fc740e701ad055a3acc34c17e9bc"
 
 
 _tmp_script=""
@@ -52,7 +53,7 @@ DATA_DIR="/usr/local/xboard-xui-bridge/data"
 DROPIN_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
 DROPIN_FILE="${DROPIN_DIR}/listen.conf"
 LOCK_FILE="/var/lock/termius-xui-bridge.lock"
-INSTALL_SH_URL="${INSTALL_SH_URL:-https://raw.githubusercontent.com/${GITHUB_REPO}/80e2a3006ff1ad697b64481a38e38e1fe809c386/install.sh}"
+INSTALL_SH_URL="${INSTALL_SH_URL:-https://raw.githubusercontent.com/${GITHUB_REPO}/v0.12.0/install.sh}"
 
 info()  { echo "[INFO] $*"; }
 warn()  { echo "[WARN] $*" >&2; }
@@ -90,7 +91,8 @@ info "Tailscale IPv4: ${TS_IP}"
 
 # ---- 下载 fork 的 install.sh 并做来源自检 ----
 tmp_installer="$(mktemp /tmp/xui-bridge-install.XXXXXX.sh)"
-trap 'rm -f "${tmp_installer}"' EXIT
+tmp_release=""
+trap 'rm -f "${tmp_installer}"; [[ -z "${tmp_release}" ]] || rm -rf -- "${tmp_release}"' EXIT
 
 info "下载安装脚本: ${INSTALL_SH_URL}"
 if [[ -n "${INSTALLER_LOCAL:-}" ]]; then
@@ -103,6 +105,24 @@ fi
 [[ "${INSTALLER_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || die "必须填写安装器SHA256"
 [[ "$(sha256sum "$tmp_installer" | awk '{print $1}')" == "$INSTALLER_SHA256" ]] || die "安装器摘要不符"
 [[ -n "${BRIDGE_VERSION:-}" ]] || die "必须指定固定版本"
+# Published assets are pinned independently of the downloadable checksum file.
+# Fetch/verify the candidate before the installer can alter the running binary/service.
+if [[ -z "${BRIDGE_LOCAL_BINARY:-}" ]]; then
+  case "$(uname -m)" in
+    x86_64|amd64) release_arch="linux-amd64"; release_sha="dd692505a7d4878853d3367d1e1a69dc50d73c4cf126ee5f4d258b86221a63e9" ;;
+    aarch64|arm64) release_arch="linux-arm64"; release_sha="28a3e02bf309be16a4b85d24043ca54c94bbb4f687642602284e21437f2676e4" ;;
+    armv7l|armv7|armhf) release_arch="linux-arm"; release_sha="164ac43f58bffa3d16f87e5833e19a5439d911d3b25c658d3b7319b02eaace05" ;;
+    *) die "不支持的系统架构" ;;
+  esac
+  tmp_release="$(mktemp -d /tmp/xbridge-release.XXXXXX)"
+  release_url="https://github.com/${GITHUB_REPO}/releases/download/${BRIDGE_VERSION}/xboard-xui-bridge-${release_arch}.tar.gz"
+  curl -fsSL --connect-timeout 10 --max-time 120 "$release_url" -o "$tmp_release/package.tar.gz" || die "发行包下载失败"
+  [[ "$(sha256sum "$tmp_release/package.tar.gz" | awk '{print $1}')" == "$release_sha" ]] || die "发行包固定摘要不符"
+  tar -xzf "$tmp_release/package.tar.gz" -C "$tmp_release" xboard-xui-bridge
+  [[ -f "$tmp_release/xboard-xui-bridge" && ! -L "$tmp_release/xboard-xui-bridge" ]] || die "发行包二进制无效"
+  BRIDGE_LOCAL_BINARY="$tmp_release/xboard-xui-bridge"
+  BRIDGE_LOCAL_SHA256="$(sha256sum "$BRIDGE_LOCAL_BINARY" | awk '{print $1}')"
+fi
 export BRIDGE_VERSION BRIDGE_LOCAL_BINARY BRIDGE_LOCAL_SHA256
 
 # 自检：脚本内 GITHUB_REPO 必须指向本 fork，否则二进制会从别处下载
