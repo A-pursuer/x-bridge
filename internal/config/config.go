@@ -151,15 +151,15 @@ const (
 
 // 默认值常量。值的选择动机详见 Validate 中各分支注释。
 const (
-	defaultLogLevel             = "info"
-	defaultXboardTimeoutSec     = 15
-	defaultXboardUserAgent      = "xboard-xui-bridge"
-	defaultXuiTimeoutSec        = 15
-	defaultIntervalSec          = 60 // 与 Xboard 推荐周期一致
-	minIntervalSec              = 5  // 防止配置错把面板打挂
-	defaultWebListenAddr        = "127.0.0.1:8787"
-	defaultWebSessionMaxHours   = 24 * 7  // 7 天滑动窗口
-	defaultWebAbsoluteMaxHours  = 24 * 30 // 30 天绝对上限
+	defaultLogLevel            = "info"
+	defaultXboardTimeoutSec    = 15
+	defaultXboardUserAgent     = "xboard-xui-bridge"
+	defaultXuiTimeoutSec       = 15
+	defaultIntervalSec         = 60 // 与 Xboard 推荐周期一致
+	minIntervalSec             = 5  // 防止配置错把面板打挂
+	defaultWebListenAddr       = "127.0.0.1:8787"
+	defaultWebSessionMaxHours  = 24 * 7  // 7 天滑动窗口
+	defaultWebAbsoluteMaxHours = 24 * 30 // 30 天绝对上限
 )
 
 // Root 是配置文件的根节点。
@@ -586,7 +586,7 @@ func (r *Root) Validate() error {
 
 	// ---------------- intervals（默认 60s，最低 minIntervalSec 防止把面板打挂） ----------------
 	if r.Intervals.UserPullSec <= 0 {
-		r.Intervals.UserPullSec = defaultIntervalSec
+		r.Intervals.UserPullSec = 15
 	}
 	if r.Intervals.TrafficPushSec <= 0 {
 		r.Intervals.TrafficPushSec = defaultIntervalSec

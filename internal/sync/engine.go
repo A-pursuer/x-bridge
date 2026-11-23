@@ -161,9 +161,10 @@ func (e *Engine) Run(ctx context.Context) {
 // 字段在装配后只读；四个 goroutine 并行访问也无需加锁——store 内部
 // 已经线程安全，httpClient 同理。
 type bridgeWorker struct {
-	cfg       config.Bridge
-	intervals config.Intervals
-	reporting config.Reporting
+	lifecycleMu stdsync.Mutex
+	cfg         config.Bridge
+	intervals   config.Intervals
+	reporting   config.Reporting
 
 	adapter protocol.Adapter
 	xboardC *xboard.Client

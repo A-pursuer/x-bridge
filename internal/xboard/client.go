@@ -266,6 +266,12 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		// net/url.Error includes the complete query string (server token). Keep
+		// only the underlying transport error for retry logs and Web status.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err
+		}
 		return nil, &Error{HTTPStatus: 0, Endpoint: path, Message: err.Error()}
 	}
 	return resp, nil

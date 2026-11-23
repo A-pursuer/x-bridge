@@ -38,10 +38,13 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version: "1.26.5"
 
       - name: Build web frontend (npm ci, lockfile-pinned)
         run: make web
+
+      - name: Verify Go packages
+        run: go test ./...
 
       - name: Build binaries
         run: make build-linux build-arm64 build-arm VERSION=${{ github.ref_name }}

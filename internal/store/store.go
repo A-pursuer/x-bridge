@@ -38,6 +38,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/xboard-bridge/xboard-xui-bridge/internal/traffic"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -165,6 +166,16 @@ type SessionRow struct {
 // 所有方法都接受 context.Context：方便上层在主循环退出时通过 ctx 取消未完成的查询，
 // 而不是盲目等待 SQLite 锁释放。
 type Store interface {
+	ObserveTraffic(context.Context, string, string, int64, int64) (TrafficPosition, error)
+	PendingTrafficBatch(context.Context, string) (OutboxBatch, error)
+	PrepareTrafficBatch(context.Context, string, int, string) (OutboxBatch, error)
+	SetTrafficBatchState(context.Context, string, string, string) error
+	AckTrafficBatch(context.Context, OutboxBatch, traffic.Receipt) error
+	TrafficBatchStatus(context.Context, string) ([]OutboxBatch, error)
+
+	ListRetirements(context.Context, string) ([]Retirement, error)
+	SaveRetirement(context.Context, Retirement) error
+
 	// ============ traffic_baseline ============
 
 	// EnsureBaseline 在记录不存在时插入零基线，存在时仅更新 xboard_user_id
@@ -392,7 +403,7 @@ type sqliteStore struct {
 //	                     上层捕获后下个周期重试，不会丢失数据。
 //	_journal_mode=WAL    Write-Ahead Logging 提升单写多读并发；
 //	                     代价是产生 -shm/-wal 副本文件，运维迁移时需一并复制。
-//	_synchronous=NORMAL  在 WAL 下安全；FULL 太慢，OFF 在断电时可能损坏。
+//	_synchronous=FULL    outbox / ACK 提交必须在断电后仍然持久。
 func OpenSQLite(path string) (Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("store: SQLite 路径不可为空")
@@ -412,7 +423,7 @@ func OpenSQLite(path string) (Store, error) {
 	// 时撞上 BUSY 而失败）。
 	// 唯一影响：本包内显式 BeginTx 都改为 IMMEDIATE 语义；其它路径全部走
 	// auto-commit 的 ExecContext / QueryContext，不受影响。
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_txlock=immediate", path)
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_txlock=immediate", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("打开 SQLite %q：%w", path, err)
@@ -546,11 +557,11 @@ const legacyDefaultPanelName = "default"
 //
 // 迁移动作（单事务，任一步失败整体回滚）：
 //
-//	1) INSERT xui_panels('default', <legacy 值>)；
-//	2) UPDATE bridges SET xui_panel='default' WHERE TRIM(xui_panel)=''——
-//	   存量桥接全部指向迁移面板，升级后行为与旧版完全一致；
-//	3) DELETE settings 中全部 xui.* 键——避免"两处真相源"心智负担；
-//	   v0.4/v0.5 残留的 xui.username / xui.password 等也一并清掉。
+//  1. INSERT xui_panels('default', <legacy 值>)；
+//  2. UPDATE bridges SET xui_panel='default' WHERE TRIM(xui_panel)=”——
+//     存量桥接全部指向迁移面板，升级后行为与旧版完全一致；
+//  3. DELETE settings 中全部 xui.* 键——避免"两处真相源"心智负担；
+//     v0.4/v0.5 残留的 xui.username / xui.password 等也一并清掉。
 func runLegacyXuiMigration(ctx context.Context, db *sql.DB) error {
 	var panelCount int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM xui_panels;`).Scan(&panelCount); err != nil {
@@ -881,7 +892,7 @@ func (s *sqliteStore) DeleteBaseline(ctx context.Context, bridgeName, email stri
 // GetSetting 实现 Store 接口。
 //
 // 双返回值（value, exists）的设计动机详见接口注释。注意：value 字段
-// 在 schema.go 中声明 NOT NULL DEFAULT ''，因此 exists=true 时 value 永远
+// 在 schema.go 中声明 NOT NULL DEFAULT ”，因此 exists=true 时 value 永远
 // 是字符串（可能为空字符串），不会出现 NULL 扫描错误。
 func (s *sqliteStore) GetSetting(ctx context.Context, key string) (string, bool, error) {
 	const q = `SELECT value FROM settings WHERE key = ?;`
@@ -1077,6 +1088,15 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 //
 // 防御性校验：与 CreateBridge 一致，name / protocol 经 TrimSpace 后不可为空。
 func (s *sqliteStore) UpdateBridge(ctx context.Context, b BridgeRow) error {
+	var mapping string
+	e := s.db.QueryRowContext(ctx, `SELECT mapping FROM traffic_sources WHERE bridge_name=?`, b.Name).Scan(&mapping)
+	if e != nil && !errors.Is(e, sql.ErrNoRows) {
+		return e
+	}
+	if e == nil && mapping != fmt.Sprintf("%d:%s:%d", b.XboardNodeID, b.XuiPanel, b.XuiInboundID) {
+		return fmt.Errorf("source mapping is immutable after accounting starts; reconcile first")
+	}
+
 	if strings.TrimSpace(b.Name) == "" {
 		return errors.New("UpdateBridge: name 不可为空")
 	}
@@ -1632,8 +1652,8 @@ func scanBaseline(scan func(...any) error) (Baseline, error) {
 // 任何 SELECT 列序变更都需要同步修改本函数的扫描指针顺序。
 func scanBridge(scan func(...any) error) (BridgeRow, error) {
 	var (
-		b                BridgeRow
-		enableInt        int64
+		b                        BridgeRow
+		enableInt                int64
 		createdAtTS, updatedAtTS int64
 	)
 	err := scan(
@@ -1656,7 +1676,7 @@ func scanBridge(scan func(...any) error) (BridgeRow, error) {
 // 判断展示策略（"从未登录"等）。
 func scanAdminUser(scan func(...any) error) (AdminUserRow, error) {
 	var (
-		u                                            AdminUserRow
+		u                                       AdminUserRow
 		createdAtTS, updatedAtTS, lastLoginAtTS int64
 	)
 	err := scan(
@@ -1675,7 +1695,7 @@ func scanAdminUser(scan func(...any) error) (AdminUserRow, error) {
 // scanSession 把数据库行扫描到 SessionRow。
 func scanSession(scan func(...any) error) (SessionRow, error) {
 	var (
-		s                                                SessionRow
+		s                                    SessionRow
 		createdAtTS, expiresAtTS, lastSeenTS int64
 	)
 	err := scan(
@@ -1754,4 +1774,39 @@ func sessionTokenHash(token string) string {
 	}
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:4])
+}
+
+// Retirement preserves the final observation across restart before destructive cleanup.
+type Retirement struct {
+	Bridge    string `json:"bridge"`
+	Email     string `json:"email"`
+	UID       int64  `json:"uid"`
+	State     string `json:"state"`
+	Up        int64  `json:"up"`
+	Down      int64  `json:"down"`
+	CurUp     int64  `json:"cur_up"`
+	CurDown   int64  `json:"cur_down"`
+	UpdatedAt int64  `json:"updated_at"`
+	Detail    string `json:"detail"`
+}
+
+func (s *sqliteStore) ListRetirements(ctx context.Context, bridge string) ([]Retirement, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT bridge_name,email,uid,state,up,down,cur_up,cur_down,updated_at,detail FROM traffic_retirements WHERE bridge_name=? AND state!='completed' ORDER BY email`, bridge)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Retirement{}
+	for rows.Next() {
+		var r Retirement
+		if err = rows.Scan(&r.Bridge, &r.Email, &r.UID, &r.State, &r.Up, &r.Down, &r.CurUp, &r.CurDown, &r.UpdatedAt, &r.Detail); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+func (s *sqliteStore) SaveRetirement(ctx context.Context, r Retirement) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO traffic_retirements(bridge_name,email,uid,state,up,down,cur_up,cur_down,updated_at,detail) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(bridge_name,email) DO UPDATE SET uid=excluded.uid,state=excluded.state,up=excluded.up,down=excluded.down,cur_up=excluded.cur_up,cur_down=excluded.cur_down,updated_at=excluded.updated_at,detail=excluded.detail`, r.Bridge, r.Email, r.UID, r.State, r.Up, r.Down, r.CurUp, r.CurDown, r.UpdatedAt, r.Detail)
+	return err
 }

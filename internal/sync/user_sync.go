@@ -30,6 +30,8 @@ import (
 //	并仅处理仍然不一致的部分，无需补偿动作。这避免了"多步部分成功"导致
 //	的中间状态——下一周期重做即可幂等。
 func (w *bridgeWorker) syncUsers(ctx context.Context) error {
+	w.lifecycleMu.Lock()
+	defer w.lifecycleMu.Unlock()
 	// 取本次 tick 的 trace 化 logger（含 loop=user_sync + trace_id）；详见
 	// engine.go runStep 中的 trace_id 注入逻辑。子函数 buildWantedClients /
 	// parseExistingManagedClients / applyXxx 当前不打日志，故只在主入口
@@ -56,7 +58,18 @@ func (w *bridgeWorker) syncUsers(ctx context.Context) error {
 		return fmt.Errorf("解析 inbound.settings：%w", err)
 	}
 
+	retirements, err := w.store.ListRetirements(ctx, w.cfg.Name)
+	if err != nil {
+		return err
+	}
+	for _, r := range retirements {
+		delete(wanted, r.Email)
+	}
 	toAdd, toUpdate, toDelete := diffClients(wanted, existing)
+	for _, r := range retirements {
+		toDelete[r.Email] = struct{}{}
+	}
+	retireErr := w.retireClients(ctx, toDelete, existing)
 
 	log.Info("用户 diff 完成",
 		"xboard_users", len(users.Users),
@@ -72,9 +85,6 @@ func (w *bridgeWorker) syncUsers(ctx context.Context) error {
 	if err := w.applyUpdate(ctx, toUpdate); err != nil {
 		return err
 	}
-	if err := w.applyDelete(ctx, toDelete); err != nil {
-		return err
-	}
 
 	// store 侧同步基线：先把不再存在的清掉（避免"无主"基线占空间），再为新增 / 已存在的用户登记。
 	for email := range toDelete {
@@ -84,12 +94,31 @@ func (w *bridgeWorker) syncUsers(ctx context.Context) error {
 	}
 	for _, u := range users.Users {
 		email := protocol.MakeEmail(u.UUID, w.cfg.XboardNodeID)
+		if _, ok := wanted[email]; !ok {
+			continue
+		}
 		if _, err := w.store.EnsureBaseline(ctx, w.cfg.Name, email, u.ID); err != nil {
 			return fmt.Errorf("登记基线 %s：%w", email, err)
 		}
 	}
 
-	return nil
+	if len(toAdd) > 0 || len(toUpdate) > 0 {
+		latest, e := w.xuiC.GetInbound(ctx, w.cfg.XuiInboundID)
+		if e != nil {
+			return e
+		}
+		actual, e := w.parseExistingManagedClients(latest.RawSettings)
+		if e != nil {
+			return e
+		}
+		for email, want := range wanted {
+			got, ok := actual[email]
+			if !ok || needsUpdate(got, want) {
+				return fmt.Errorf("panel readback differs from requested client configuration")
+			}
+		}
+	}
+	return retireErr
 }
 
 // buildWantedClients 把 Xboard 用户列表通过协议适配器转成 ClientSettings。
@@ -243,7 +272,7 @@ func needsUpdate(ex, want xui.ClientSettings) bool {
 		ex.Password != want.Password ||
 		ex.Auth != want.Auth ||
 		ex.Flow != want.Flow ||
-		ex.SubID != want.SubID ||
+		(want.SubID != "" && ex.SubID != want.SubID) ||
 		ex.ExpiryTime != want.ExpiryTime ||
 		ex.TotalGB != want.TotalGB ||
 		ex.Reset != want.Reset ||

@@ -50,7 +50,7 @@ set -euo pipefail
 # 让 trap ERR 在 subshell / function / pipeline 内同样生效。
 set -E -o pipefail
 
-SCRIPT_VERSION="0.8.4"
+SCRIPT_VERSION="0.8.4-idempotency-20261123"
 
 # ---------------- 颜色与日志辅助 ----------------
 # 仅当 stdout 是终端且 NO_COLOR 未设置时启用彩色。被 pipe 到文件 / cron
@@ -327,6 +327,19 @@ get_installed_version() {
     fi
 }
 
+# Validate the downloaded/local candidate before replacing an executing binary.
+install_candidate() (
+    local candidate="$1" expected_version="$2" staged=""
+    [[ "$(timeout 5 "$candidate" version | awk '{print $2}')" == "$expected_version" ]] || fail "目标二进制版本不符"
+    if [[ "${BRIDGE_REQUIRE_TRAFFIC_PROTOCOL:-}" == traffic-batch-v1 ]]; then
+        [[ "$(timeout 5 "$candidate" --traffic-protocol 2>/dev/null)" == traffic-batch-v1 ]] || fail "目标二进制不支持已有幂等账本，拒绝回退"
+    fi
+    staged=$(mktemp "${BIN_PATH}.new.XXXXXX")
+    trap '[[ -z "$staged" ]] || rm -f -- "$staged"' EXIT
+    install -m 0755 "$candidate" "$staged"
+    mv -f "$staged" "$BIN_PATH"
+)
+
 # download_and_install 下载 release tarball、校验 SHA256、解压安装。
 download_and_install() {
     local arch="$1"
@@ -350,7 +363,7 @@ download_and_install() {
                 local expected actual
                 expected=$(grep " ${asset}\$" "${tmpdir}/SHA256SUMS.txt" | awk '{print $1}' || true)
                 if [[ -z "${expected}" ]]; then
-                    log_warn "SHA256SUMS.txt 中未找到 ${asset}，跳过校验（release 可能未发布该文件）"
+                    fail "SHA256SUMS.txt 缺少目标资产摘要"
                 else
                     actual=$(sha256sum "${tmpdir}/${asset}" | awk '{print $1}')
                     if [[ "${expected}" != "${actual}" ]]; then
@@ -359,15 +372,15 @@ download_and_install() {
                     log_info "SHA256 校验通过"
                 fi
             else
-                log_warn "未安装 sha256sum，跳过校验（建议 apt install coreutils）"
+                fail "缺少 sha256sum，拒绝未校验安装"
             fi
         else
-            log_warn "无法获取 SHA256SUMS.txt（旧 release 可能未发布），跳过校验"
+            fail "无法取得发行摘要，拒绝未校验安装"
         fi
 
         log_step "解压并安装到 ${BIN_PATH}"
         tar -xzf "${tmpdir}/${asset}" -C "${tmpdir}"
-        install -m 0755 "${tmpdir}/xboard-xui-bridge" "${BIN_PATH}"
+        install_candidate "${tmpdir}/xboard-xui-bridge" "$version"
     )
 }
 
@@ -671,13 +684,25 @@ show_post_install() {
 
 # ---------------- 子命令实现 ----------------
 cmd_install() {
+    # Validate local accepted input before dependencies or service operations.
+    if [[ -n "${BRIDGE_LOCAL_BINARY:-}" ]]; then
+        [[ -f "$BRIDGE_LOCAL_BINARY" && "${BRIDGE_LOCAL_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || fail "本地验收二进制或摘要无效"
+        [[ "$(sha256sum "$BRIDGE_LOCAL_BINARY" | awk '{print $1}')" == "$BRIDGE_LOCAL_SHA256" ]] || fail "本地二进制摘要不符"
+        [[ "$("$BRIDGE_LOCAL_BINARY" version | awk '{print $2}')" == "${BRIDGE_VERSION:-}" ]] || fail "验收二进制版本不符"
+    fi
     install_dependencies
 
     local arch version
     arch=$(detect_arch)
     log_info "架构：${arch}"
 
-    version=$(get_latest_version)
+    if [[ -f "${INSTALL_DIR}/data/bridge.db" ]]; then
+        command -v sqlite3 >/dev/null 2>&1 || fail "缺少sqlite3，不能判定已有流量账本兼容性"
+        if [[ "$(sqlite3 "${INSTALL_DIR}/data/bridge.db" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='traffic_outbox';")" == 1 ]]; then
+        export BRIDGE_REQUIRE_TRAFFIC_PROTOCOL=traffic-batch-v1
+        fi
+    fi
+    version="${BRIDGE_VERSION:-$(get_latest_version)}"
     local current
     current=$(get_installed_version)
     if [[ "${current}" != "(none)" ]]; then
@@ -692,7 +717,14 @@ cmd_install() {
     fi
 
     backup_existing
-    download_and_install "${arch}" "${version}"
+    if [[ -n "${BRIDGE_LOCAL_BINARY:-}" ]]; then
+        [[ -f "$BRIDGE_LOCAL_BINARY" && "$BRIDGE_LOCAL_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail "本地验收二进制或摘要无效"
+        [[ "$(sha256sum "$BRIDGE_LOCAL_BINARY" | awk '{print $1}')" == "$BRIDGE_LOCAL_SHA256" ]] || fail "本地二进制摘要不符"
+        install_candidate "$BRIDGE_LOCAL_BINARY" "$version"
+    else
+        [[ "$version" != *-retention-* && "$version" != *-idempotency-* ]] || fail "此覆盖版本尚未发布；请使用验收本地二进制"
+        download_and_install "${arch}" "${version}"
+    fi
     setup_directories
     write_systemd_unit
     install_helper

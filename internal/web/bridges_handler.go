@@ -66,11 +66,11 @@ func (s *Server) handleListBridges(w http.ResponseWriter, r *http.Request) {
 //
 // 行为：
 //
-//   1) 解析 body；
-//   2) 调 store.CreateBridge（store 内部已做 name/protocol 非空校验 +
-//      唯一约束映射）；
-//   3) 调 reload；
-//   4) 返回新建项。
+//  1. 解析 body；
+//  2. 调 store.CreateBridge（store 内部已做 name/protocol 非空校验 +
+//     唯一约束映射）；
+//  3. 调 reload；
+//  4. 返回新建项。
 //
 // 注意：不在本 handler 做 protocol 取值合法性校验——store 层用 NOT NULL
 // 仅保 name/protocol 非空，真正的"是否在 allowedProtocols 内"由
@@ -257,6 +257,31 @@ func (s *Server) handleDeleteBridge(w http.ResponseWriter, r *http.Request) {
 	name, ok := exactBridgePathName(r)
 	if !ok {
 		s.writeError(w, http.StatusBadRequest, errCodeBadRequest, "URL 缺少 name")
+		return
+	}
+	rows, e := s.store.ListBaselinesByBridge(r.Context(), name)
+	if e != nil {
+		s.writeError(w, 500, errCodeInternal, "检查流量基线失败")
+		return
+	}
+	pending, e := s.store.ListRetirements(r.Context(), name)
+	if e != nil {
+		s.writeError(w, 500, errCodeInternal, "检查流量收尾失败")
+		return
+	}
+	outbox, e := s.store.TrafficBatchStatus(r.Context(), name)
+	if e != nil {
+		s.writeError(w, 500, errCodeInternal, "检查流量批次失败")
+		return
+	}
+	unsettled := false
+	for _, b := range outbox {
+		if b.State != "processed" {
+			unsettled = true
+		}
+	}
+	if len(rows) > 0 || len(pending) > 0 || unsettled {
+		s.writeError(w, 409, errCodeConflict, "桥接仍有计费基线或待结算记录，不能删除重建；请先迁出用户并完成结算")
 		return
 	}
 	// 步骤 1：删 bridges 行（不动 baseline）。仍走 r.Context()——客户端

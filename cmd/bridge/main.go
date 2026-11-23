@@ -82,6 +82,9 @@ func main() {
 		case "reset-password":
 			runResetPassword(args[1:])
 			return
+		case "--traffic-protocol":
+			fmt.Println("traffic-batch-v1")
+			return
 		case "version", "--version", "-version":
 			fmt.Println("xboard-xui-bridge", version)
 			return
@@ -315,12 +318,12 @@ func runDaemon(args []string) {
 //
 // 流程：
 //
-//	1. 解析 --db / --user 参数；
-//	2. 打开 SQLite；
-//	3. 按 username 查找用户；
-//	4. 交互式提示输入新密码（隐藏明文输入，确认两次）；
-//	5. 调 auth.Service.ResetPassword（事务保证：改密 + 删全部 session）；
-//	6. 打印成功提示并退出。
+//  1. 解析 --db / --user 参数；
+//  2. 打开 SQLite；
+//  3. 按 username 查找用户；
+//  4. 交互式提示输入新密码（隐藏明文输入，确认两次）；
+//  5. 调 auth.Service.ResetPassword（事务保证：改密 + 删全部 session）；
+//  6. 打印成功提示并退出。
 //
 // 安全考虑：本子命令没有"二次鉴权"——一旦能在本地 shell 跑就视作受信任。
 // 这与传统 Linux 服务（如 redis-cli AUTH 重置）一致，是合理的"信任本地"

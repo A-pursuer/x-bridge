@@ -26,7 +26,7 @@ import (
 //	id          : 节点计费 UID。V1 是用户 ID，XBoard 多订阅 V2 是订阅 ID；
 //	              Bridge 必须把它视为不透明主键，上报流量时原样作为 map key。
 //	uuid        : 客户端密码（除 SS-2022 外所有协议直接拿它当 password）。
-//	speed_limit : bps；0 表示不限速。
+//	speed_limit : Mbps；0 表示不限速。
 //	device_limit: 最大设备数；0 表示不限。
 type User struct {
 	ID          int64  `json:"id"`

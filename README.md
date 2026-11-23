@@ -1,6 +1,18 @@
 <div align="center">
 
+## v0.12.0 发行
+
+包含当前已部署验收的用户轮询、撤权收尾、双端traffic-batch-v1幂等账本和批次状态UI。需要配套 TianYuan XBoard 6.4.2；不自动回退旧push。限速和跨节点统一IP上限继续后置。发行坐标与运行中的本地覆盖版本分开记录，发行本身不替换生产二进制。
+
+## 2026-11-23 本地已部署覆盖（尚未发行）
+
+运行 v0.11.1-idempotency-20261123，需配套自维护 XBoard traffic-batch-v1 接口。流量批次先持久化，取得数据库事务回执才确认基线；超时/重启查询或重放同批次，禁止自动回退旧push。当前协议、测试与恢复限制见 [幂等修复记录](docs/traffic-idempotency-20261123.md)。既有15秒用户轮询、撤权收尾、仅逐节点IP上限保持；限速等待3x-ui接口，跨节点统一上限后置。下面旧版说明作为历史背景，重复计费窗口已由双端协议补上。
+
+<!-- Current deployment overlay is documented separately from immutable releases. -->
+
 # xboard-xui-bridge（多面板 fork）
+
+当前本地部署补丁：`v0.11.1-retention-20261123`（未提交/发行），详见 [维护记录](docs/maintenance-20261123.md)。正式发行仍为 v0.11.1。
 
 **[Xboard](https://github.com/cedar2025/Xboard) 与 [3x-ui](https://github.com/MHSanaei/3x-ui) 的非侵入式中间件**
 

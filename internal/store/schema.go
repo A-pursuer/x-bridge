@@ -20,16 +20,16 @@
 //
 // 差量计算流程（详见 store.RecordSeen + Store.ApplyReportSuccess）：
 //
-//	1) 拉到 cur_up / cur_down；
-//	2) 若 cur_* < last_seen_*：检测到重置，pending_* += (last_seen_* - reported_*)，
-//	   reported_* 视为 0；持久化新 pending 与 reported；
-//	3) last_seen_* = cur_*；
-//	4) delta_up   = (cur_up   - reported_up)   + pending_up
-//	   delta_down = (cur_down - reported_down) + pending_down；
-//	5) 调 Xboard /push；
-//	6) 成功 → ApplyReportSuccess(cur_up, cur_down)
-//	          推进 reported = cur，pending 清零；
-//	   失败 → 不动，下次循环重新计算（pending 已经持久化，不会因失败而丢）。
+//  1. 拉到 cur_up / cur_down；
+//  2. 若 cur_* < last_seen_*：检测到重置，pending_* += (last_seen_* - reported_*)，
+//     reported_* 视为 0；持久化新 pending 与 reported；
+//  3. last_seen_* = cur_*；
+//  4. delta_up   = (cur_up   - reported_up)   + pending_up
+//     delta_down = (cur_down - reported_down) + pending_down；
+//  5. 调 Xboard /push；
+//  6. 成功 → ApplyReportSuccess(cur_up, cur_down)
+//     推进 reported = cur，pending 清零；
+//     失败 → 不动，下次循环重新计算（pending 已经持久化，不会因失败而丢）。
 //
 // 不可消除的边界（详见 traffic_sync 注释）：
 //
@@ -46,34 +46,47 @@
 // 不再读取 config.yaml。下列表负责承载原本写在 yaml 里的所有字段以及 Web 面板
 // 自身需要的鉴权 / 会话状态。
 //
-//   settings        分组式 KV，存放 xboard.* / xui.* / log.* / intervals.* /
-//                   reporting.* / web.* 等运行参数；key 以"分组.字段"形式组织
-//                   （例如 "xboard.api_host"），value 一律为字符串——业务侧
-//                   按需自行 strconv 转换；这种"扁平 KV"在 SQLite 上 IO 路径
-//                   最短，且未来追加字段不需要修改 schema。
-//   bridges         按 name 主键存储桥接配置，逐行映射到 config.Bridge 结构体；
-//                   独立成表的目的是支持 Web GUI 上"按行 CRUD"，并保留各项
-//                   created_at / updated_at 用于运维观测。
-//   admin_users     Web 面板管理员账户表；password_hash 存储 bcrypt 输出；
-//                   首次启动时由进程创建一个随机密码的 admin 账户（密码同时
-//                   写入日志与 data/initial_password.txt 双通道，防止日志滚动
-//                   后无从找回）。
-//   sessions        登录后的浏览器会话凭证；token 是 base64url 编码的 32 字节
-//                   随机数；服务端校验时按 token 主键查找；过期或登出时删除。
-//                   保留 last_seen 字段为"滑动续期"算法服务（每次活动把
-//                   expires_at 推到 last_seen + 7d）。注意：token 总寿命的
-//                   绝对上限由调用方（auth 中间件）按 created_at +
-//                   absoluteMaxLifetime 计算并 cap 后再写回，本表不强制；
-//                   详见 sessions 表注释与 SessionRow 字段说明。
+//	settings        分组式 KV，存放 xboard.* / xui.* / log.* / intervals.* /
+//	                reporting.* / web.* 等运行参数；key 以"分组.字段"形式组织
+//	                （例如 "xboard.api_host"），value 一律为字符串——业务侧
+//	                按需自行 strconv 转换；这种"扁平 KV"在 SQLite 上 IO 路径
+//	                最短，且未来追加字段不需要修改 schema。
+//	bridges         按 name 主键存储桥接配置，逐行映射到 config.Bridge 结构体；
+//	                独立成表的目的是支持 Web GUI 上"按行 CRUD"，并保留各项
+//	                created_at / updated_at 用于运维观测。
+//	admin_users     Web 面板管理员账户表；password_hash 存储 bcrypt 输出；
+//	                首次启动时由进程创建一个随机密码的 admin 账户（密码同时
+//	                写入日志与 data/initial_password.txt 双通道，防止日志滚动
+//	                后无从找回）。
+//	sessions        登录后的浏览器会话凭证；token 是 base64url 编码的 32 字节
+//	                随机数；服务端校验时按 token 主键查找；过期或登出时删除。
+//	                保留 last_seen 字段为"滑动续期"算法服务（每次活动把
+//	                expires_at 推到 last_seen + 7d）。注意：token 总寿命的
+//	                绝对上限由调用方（auth 中间件）按 created_at +
+//	                absoluteMaxLifetime 计算并 cap 后再写回，本表不强制；
+//	                详见 sessions 表注释与 SessionRow 字段说明。
 //
 // 为何 admin_users / sessions 单独成表而不是继续 KV：
 //
-//   a) 多账户预留：未来允许"只读访客 + 管理员"分级时不需要重写存储层；
-//   b) 索引可选：sessions 按 expires_at 索引以加速过期清理；KV 表无法这样做；
-//   c) 字段类型语义化：bcrypt hash / 时间戳列直接放对应类型，便于 SQL 调试。
+//	a) 多账户预留：未来允许"只读访客 + 管理员"分级时不需要重写存储层；
+//	b) 索引可选：sessions 按 expires_at 索引以加速过期清理；KV 表无法这样做；
+//	c) 字段类型语义化：bcrypt hash / 时间戳列直接放对应类型，便于 SQL 调试。
 package store
 
 const schemaSQL = `
+CREATE TABLE IF NOT EXISTS traffic_sources(bridge_name TEXT PRIMARY KEY,source_id TEXT NOT NULL UNIQUE,last_seq INTEGER NOT NULL,mapping TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS traffic_positions(bridge_name TEXT NOT NULL,email TEXT NOT NULL,uid INTEGER NOT NULL,observed_up INTEGER NOT NULL,observed_down INTEGER NOT NULL,acked_up INTEGER NOT NULL,acked_down INTEGER NOT NULL,PRIMARY KEY(bridge_name,email));
+CREATE TABLE IF NOT EXISTS traffic_outbox(bridge_name TEXT NOT NULL,node_id INTEGER NOT NULL,source_id TEXT NOT NULL,seq INTEGER NOT NULL,batch_id TEXT PRIMARY KEY,payload TEXT NOT NULL,snapshots TEXT NOT NULL,state TEXT NOT NULL,detail TEXT NOT NULL,receipt TEXT NOT NULL DEFAULT '',updated_at INTEGER NOT NULL,UNIQUE(source_id,seq));
+CREATE INDEX IF NOT EXISTS idx_traffic_outbox_bridge ON traffic_outbox(bridge_name,state,seq);
+
+CREATE TABLE IF NOT EXISTS traffic_retirements (
+ bridge_name TEXT NOT NULL, email TEXT NOT NULL, uid INTEGER NOT NULL,
+ state TEXT NOT NULL, up INTEGER NOT NULL DEFAULT 0, down INTEGER NOT NULL DEFAULT 0,
+ cur_up INTEGER NOT NULL DEFAULT 0, cur_down INTEGER NOT NULL DEFAULT 0,
+ updated_at INTEGER NOT NULL, detail TEXT NOT NULL DEFAULT '',
+ PRIMARY KEY(bridge_name,email)
+);
+
 CREATE TABLE IF NOT EXISTS traffic_baseline (
     bridge_name        TEXT    NOT NULL,
     email              TEXT    NOT NULL,

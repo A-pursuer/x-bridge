@@ -68,6 +68,9 @@ const bridges = ref<Bridge[]>([])
 const panels = ref<XuiPanel[]>([])
 // syncStatus：桥接名 → 各同步循环最近结果（fork 可观测性扩展）。
 const syncStatus = ref<Record<string, LoopStatus[]>>({})
+const trafficBatches=ref<Record<string,Array<{batch_id:string;seq:number;state:string;detail:string;updated_at:number;subscription_ids:number[]}>>>({})
+const retirements=ref<Record<string, Record<string,number>>>({})
+const retirementDetails=ref<Record<string,Array<{uid:number;state:string;detail:string}>>>({})
 const loading = ref(true)
 
 // bridgeSyncState 把某桥接的多条 loop 结果聚合成一个卡片灯状态：
@@ -147,6 +150,9 @@ async function refresh(): Promise<void> {
     }
     if (ss.status === 'fulfilled') {
       syncStatus.value = ss.value.bridges ?? {}
+      trafficBatches.value=ss.value.traffic_batches??{}
+      retirements.value=ss.value.retirements??{}
+      retirementDetails.value=ss.value.retirement_details??{}
     } else {
       console.warn(ss.reason)
     }
@@ -379,6 +385,16 @@ onMounted(refresh)
               }}
             </span>
           </div>
+          <details v-if="trafficBatches[b.name]?.length" class="mt-2 text-xs break-all" role="status">
+            <summary>{{ $i18n.locale.startsWith('zh') ? '流量落库批次' : 'Traffic database receipts' }} · {{trafficBatches[b.name]?.[0]?.state}}</summary>
+            <p v-for="batch in trafficBatches[b.name]||[]" :key="batch.batch_id">{{batch.batch_id}} · {{batch.state}} · UID {{batch.subscription_ids.join(', ')}} · {{new Date(batch.updated_at*1000).toLocaleString()}} · {{batch.detail}}</p>
+          </details>
+          <div v-if="Object.keys(retirements[b.name]||{}).length" class="mt-2 text-xs text-amber-700 dark:text-amber-400" role="status">
+            {{ $i18n.locale.startsWith('zh') ? '流量收尾（unknown/sending 须人工核定）' : 'Traffic retirement (unknown/sending requires review)' }}:
+            {{ Object.entries(retirements[b.name]||{}).map(([state,count])=>`${state}: ${count}`).join(' · ') }}
+            <details><summary>{{ $i18n.locale.startsWith('zh') ? '收尾明细' : 'Retirement details' }}</summary><p v-for="item in retirementDetails[b.name]||[]" :key="item.uid">UID {{item.uid}} · {{item.state}} · {{item.detail}}</p></details>
+          </div>
+          <p class="mt-1 text-xs text-muted-foreground">{{ $i18n.locale.startsWith('zh') ? '同步正常表示本次API成功；IP执行及限速需分别验证。' : 'Sync success means API success; IP enforcement and speed limits require separate verification.' }}</p>
           <!--
             按钮揭示策略：触屏（pointer: coarse）常显，鼠标用户 hover/focus 才显示
             （v0.7 第 2 轮 Codex minor 反馈 #7 修复）。.reveal-on-hover 工具类

@@ -178,6 +178,9 @@ export interface LoopStatus {
 export interface SyncStatus {
   // key = 桥接名；无同步记录的桥接不出现。
   bridges: Record<string, LoopStatus[]>
+  retirements: Record<string, Record<string, number>>
+  traffic_batches: Record<string,Array<{batch_id:string;seq:number;state:string;detail:string;updated_at:number;subscription_ids:number[]}>>
+  retirement_details: Record<string,Array<{uid:number;state:string;detail:string;updated_at:number;pending_up:number;pending_down:number}>>
 }
 
 export const api = {

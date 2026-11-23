@@ -17,8 +17,28 @@ import (
 // bridges 以桥接名为 key，value 是该桥接各循环的最近状态列表（按 loop
 // 名排序）。尚无任何同步记录的桥接不出现在 map 里——前端据此显示
 // "等待首次同步"。
+type retirementDetail struct {
+	UID         int64  `json:"uid"`
+	State       string `json:"state"`
+	Detail      string `json:"detail"`
+	UpdatedAt   int64  `json:"updated_at"`
+	PendingUp   int64  `json:"pending_up"`
+	PendingDown int64  `json:"pending_down"`
+}
+type batchDetail struct {
+	BatchID   string  `json:"batch_id"`
+	Seq       int64   `json:"seq"`
+	State     string  `json:"state"`
+	Detail    string  `json:"detail"`
+	UpdatedAt int64   `json:"updated_at"`
+	UIDs      []int64 `json:"subscription_ids"`
+}
 type syncStatusResponse struct {
-	Bridges map[string][]syncstatus.LoopStatus `json:"bridges"`
+	TrafficBatches map[string][]batchDetail `json:"traffic_batches"`
+
+	RetirementDetails map[string][]retirementDetail      `json:"retirement_details"`
+	Bridges           map[string][]syncstatus.LoopStatus `json:"bridges"`
+	Retirements       map[string]map[string]int          `json:"retirements"`
 }
 
 // handleGetSyncStatus 处理 GET /api/sync-status。
@@ -36,7 +56,38 @@ func (s *Server) handleGetSyncStatus(w http.ResponseWriter, r *http.Request) {
 	for i := range rows {
 		names = append(names, rows[i].Name)
 	}
+	pending := map[string]map[string]int{}
+	batches := map[string][]batchDetail{}
+	details := map[string][]retirementDetail{}
+	for _, name := range names {
+		outbox, e := s.store.TrafficBatchStatus(r.Context(), name)
+		if e != nil {
+			s.writeError(w, 500, errCodeInternal, "查询流量批次失败")
+			return
+		}
+		for _, b := range outbox {
+			uids := []int64{}
+			for _, entry := range b.Batch.Entries {
+				uids = append(uids, entry.SubscriptionID)
+			}
+			batches[name] = append(batches[name], batchDetail{BatchID: b.Batch.BatchID, Seq: b.Batch.Seq, State: b.State, Detail: b.Detail, UpdatedAt: b.UpdatedAt, UIDs: uids})
+		}
+		items, e := s.store.ListRetirements(r.Context(), name)
+		if e != nil {
+			s.writeError(w, 500, errCodeInternal, "查询流量收尾失败")
+			return
+		}
+		counts := map[string]int{}
+		for _, item := range items {
+			counts[item.State]++
+			details[name] = append(details[name], retirementDetail{UID: item.UID, State: item.State, Detail: item.Detail, UpdatedAt: item.UpdatedAt, PendingUp: item.Up, PendingDown: item.Down})
+		}
+		pending[name] = counts
+	}
 	s.writeJSON(w, http.StatusOK, syncStatusResponse{
-		Bridges: s.syncReg.SnapshotFor(names),
+		TrafficBatches:    batches,
+		Retirements:       pending,
+		RetirementDetails: details,
+		Bridges:           s.syncReg.SnapshotFor(names),
 	})
 }
